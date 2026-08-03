@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "..1";
+const CARD_VERSION = "2.0.1";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
