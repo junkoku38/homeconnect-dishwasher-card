@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "1.1.0";
+const CARD_VERSION = "2.0.0";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -67,8 +67,60 @@ const PROGRAM_FR = {
   dishcare_dishwasher_program_super60: "Super 60 °C",
 };
 
-const LEVEL_FR = { empty: "Vide", nearly_empty: "Presque vide", full: "Plein" };
-const LEVEL_RANK = { empty: 0, nearly_empty: 1, full: 2 };
+const domainOf = (id) => (id ? String(id).split(".")[0] : null);
+
+const norm = (s) =>
+  String(s ?? "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\s-]+/g, "_");
+
+/**
+ * Table explicite état -> mode. Elle est consultée AVANT toute heuristique.
+ * La correspondance par sous-chaîne est un piège : « inactive » contient
+ * « active », « actionrequired » contient « on ». Sur Home Connect cela
+ * classait Inactive et ActionRequired en « en marche ».
+ */
+const STATE_MODE = {
+  // Home Connect
+  inactive: "idle", ready: "idle", delayedstart: "delayed", delayed_start: "delayed",
+  run: "run", pause: "run", aborting: "run",
+  finished: "done", actionrequired: "alert", action_required: "alert", error: "alert",
+  // Miele
+  off: "idle", on: "idle", idle: "idle", not_connected: "alert",
+  programmed: "delayed", waiting_to_start: "delayed",
+  in_use: "run", rinse_hold: "run", programme_interrupted: "alert",
+  end_programmed: "done", programme_ended: "done",
+  failure: "alert", service: "alert",
+  // génériques
+  standby: "idle", stopped: "idle", running: "run", washing: "run",
+  complete: "done", completed: "done", done: "done",
+};
+
+/**
+ * Repli flou pour les intégrations non répertoriées. On n'utilise que des
+ * mots distinctifs d'au moins cinq lettres, et on teste alerte puis
+ * terminé puis repos avant marche, pour qu'« inactive » ne matche jamais un
+ * mot de marche.
+ */
+const FUZZY = [
+  ["alert", ["error", "failure", "fault", "panne", "defaut", "interrupted", "actionrequired"]],
+  ["done", ["finished", "termine", "ended", "complete"]],
+  ["idle", ["inactive", "standby", "stopped", "repos", "notrunning", "not_running"]],
+  ["delayed", ["delayed", "programmed", "waiting"]],
+  ["run", ["running", "washing", "prewash", "rinsing", "drying", "heating", "in_use",
+           "lavage", "rincage", "sechage", "en_cours"]],
+];
+
+/** Niveaux de consommables : énumérations, pourcentages ou binaires. */
+const LEVEL_MAP = {
+  empty: 0, vide: 0, absent: 0, missing: 0, low: 1,
+  nearly_empty: 1, presque_vide: 1, nearly: 1,
+  full: 2, plein: 2, ok: 2, present: 2, sufficient: 2, good: 2,
+};
+const LEVEL_FR = ["Vide", "Presque vide", "Plein"];
+const LEVEL_PCT = [6, 28, 100];
 
 const COL = {
   txt: "#eef1f6",
@@ -327,10 +379,10 @@ class HomeConnectDishwasherCard extends HTMLElement {
     return new Intl.NumberFormat(this._lang(), { maximumFractionDigits: dec }).format(v);
   }
 
-  /** Durée en heures décimales -> "4 h 20" ou "35 min". */
-  _dur(h) {
-    if (h == null || Number.isNaN(h) || h < 0) return "—";
-    const total = Math.round(h * 60);
+  /** Durée en minutes -> "4 h 20" ou "35 min". */
+  _dur(minutes) {
+    if (minutes == null || Number.isNaN(minutes) || minutes < 0) return "—";
+    const total = Math.round(minutes);
     if (total < 60) return `${total} min`;
     const hh = Math.floor(total / 60);
     const mm = total % 60;
@@ -356,8 +408,105 @@ class HomeConnectDishwasherCard extends HTMLElement {
     return this._s(this._config.operation_state);
   }
 
+  /**
+   * Mode retenu : run | done | idle | delayed | alert.
+   * Table explicite d'abord, repli flou ensuite, heuristiques en dernier.
+   * Le drapeau « à vider » ne l'emporte que si aucun cycle n'est en cours.
+   */
+  _mode() {
+    const c = this._config;
+    const raw = this._rawMode();
+    /* Le drapeau ne peut requalifier qu'un appareil au repos ou déjà terminé.
+       Il ne doit jamais masquer une alerte, un cycle en cours ou un départ
+       différé : une panne resterait invisible tant que la vaisselle n'a pas
+       été vidée. */
+    if (["idle", "done"].includes(raw) && c.clean_flag && this._s(c.clean_flag) === "on")
+      return "done";
+    return raw;
+  }
+
+  _rawMode() {
+    const c = this._config;
+    const table = { ...STATE_MODE, ...(c.state_map || {}) };
+    const st = this._s(c.operation_state);
+    if (st && !["unknown", "unavailable"].includes(st)) {
+      const v = norm(st).split(".").pop();
+      if (table[v]) return table[v];
+      for (const [mode, words] of FUZZY) {
+        if (words.some((w) => v.includes(w))) return mode;
+      }
+    }
+    // Heuristiques : puissance mesurée, puis temps restant
+    const p = this._num(c.power);
+    if (p != null) return p > (Number(c.running_threshold) || 20) ? "run" : "idle";
+    const rem = this._remainingMinutes();
+    return rem != null && rem > 0 ? "run" : "idle";
+  }
+
   _running() {
-    return ["Run", "Pause", "Aborting"].includes(this._op());
+    return this._mode() === "run";
+  }
+
+  /**
+   * Minutes restantes, quelle que soit la forme de l'entité : horodatage ISO,
+   * durée HH:MM:SS, ou nombre avec unité s / min / h.
+   */
+  _remainingMinutes() {
+    const c = this._config;
+    const s = this._st(c.remaining_time);
+    if (!s) return null;
+    const raw = s.state;
+    if (["unknown", "unavailable", ""].includes(raw)) return null;
+    if (/\d{4}-\d{2}-\d{2}T/.test(raw)) {
+      const d = (new Date(raw).getTime() - Date.now()) / 60000;
+      return Number.isNaN(d) ? null : Math.max(0, d);
+    }
+    if (/^\d+:\d{2}(:\d{2})?$/.test(raw)) {
+      const p = raw.split(":").map(Number);
+      return p[0] * 60 + p[1] + (p[2] || 0) / 60;
+    }
+    const v = Number(raw);
+    if (Number.isNaN(v)) return null;
+    const u = norm(c.remaining_unit || s.attributes?.unit_of_measurement || "min");
+    if (["s", "sec", "second", "seconds"].includes(u)) return v / 60;
+    if (["h", "hour", "hours"].includes(u)) return v * 60;
+    return v;
+  }
+
+  _startInMinutes() {
+    const c = this._config;
+    const s = this._st(c.start_in);
+    if (!s) return null;
+    const v = Number(s.state);
+    if (Number.isNaN(v)) return null;
+    const u = norm(s.attributes?.unit_of_measurement || "min");
+    if (["s", "sec", "seconds"].includes(u)) return v / 60;
+    if (["h", "hour", "hours"].includes(u)) return v * 60;
+    return v;
+  }
+
+  /** Niveau d'un consommable, tolérant aux énumérations et aux binaires. */
+  _level(id) {
+    const s = this._st(id);
+    if (!s) return null;
+    const raw = s.state;
+    if (["unknown", "unavailable", ""].includes(raw)) return null;
+    const n = Number(raw);
+    if (!Number.isNaN(n)) {
+      const warn = Number(this._config.consumable_warning ?? 30);
+      const rank = n <= warn / 3 ? 0 : n <= warn ? 1 : 2;
+      return { rank, pct: Math.max(0, Math.min(100, n)), text: `${Math.round(n)} %` };
+    }
+    const v = norm(raw);
+    const map = { ...LEVEL_MAP, ...(this._config.consumable_map || {}) };
+    let rank = map[v];
+    if (rank === undefined) {
+      // capteur binaire de type « niveau bas » : on = bas
+      if (v === "on") rank = 0;
+      else if (v === "off") rank = 2;
+    }
+    if (rank === undefined) return { rank: 2, pct: 100, text: raw };
+    return { rank, pct: LEVEL_PCT[rank], text: LEVEL_FR[rank] };
   }
 
   _programLabel(raw) {
@@ -561,6 +710,12 @@ class HomeConnectDishwasherCard extends HTMLElement {
     e.opts = $(".opts");
     e.cons = $(".cons");
     e.forecast = $(".forecast");
+    e.tofill = $(".tofill");
+    e.tofillSub = $(".tofill .tsub");
+    e.bilanK = $(".bilan .bk");
+    e.bilanSrc = $(".bilan .bsrc");
+    e.bgrid = $(".bgrid");
+    e.actions = $(".actions");
     e.real = $(".real");
     e.realPower = $(".real .rp");
     e.realCycle = $(".real .rc");
@@ -570,6 +725,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
     e.footRight = $(".bar .right");
 
     if (e.halo) e.halo.addEventListener("click", () => this._more(c.operation_state));
+    if (e.tofill) e.tofill.addEventListener("click", () => this._more(c.clean_flag));
     const hero = $(".hero");
     if (hero) hero.addEventListener("click", () => this._more(c.operation_state));
     this.shadowRoot.querySelectorAll("[data-e]").forEach((el) => {
@@ -598,6 +754,15 @@ class HomeConnectDishwasherCard extends HTMLElement {
         ${nothing ? `<div class="empty-hint">Renseignez au moins « État de fonctionnement ».</div>` : ""}
 
         <div class="alert hidden">${svg(ICONS.alert)}<span class="msg"></span></div>
+
+        ${
+          c.clean_flag
+            ? `<div class="tofill hidden">
+                 <span class="tdot"></span>
+                 <span class="ttxt"><b>À vider</b><span class="tsub">—</span></span>
+               </div>`
+            : ""
+        }
 
         ${
           !nothing
@@ -644,6 +809,13 @@ class HomeConnectDishwasherCard extends HTMLElement {
             : ""
         }
 
+        <div class="bilan">
+          <div class="lbl"><span class="bk">Bilan du cycle</span><span class="bsrc"></span></div>
+          <div class="bgrid"></div>
+        </div>
+
+        <div class="actions hidden"></div>
+
         <div class="bar">
           <span class="left"></span>
           <span class="right"></span>
@@ -659,9 +831,11 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (!this._hass || !this._built) return;
 
     const op = this._op();
-    const running = this._running();
-    const finished = op === "Finished";
-    const problem = ["Error", "ActionRequired"].includes(op);
+    const mode = this._mode();
+    const running = mode === "run";
+    const finished = mode === "done";
+    const problem = mode === "alert";
+    const delayed = mode === "delayed";
 
     e.hn.textContent = c.area ? `${c.name} · ${c.area}` : c.name;
 
@@ -686,18 +860,29 @@ class HomeConnectDishwasherCard extends HTMLElement {
     /* Bandeau : problème, ou porte ouverte pendant un cycle */
     if (e.alert) {
       const msgs = [];
-      if (op === "Error") msgs.push("Erreur signalée par l'appareil");
-      if (op === "ActionRequired") msgs.push("Action requise sur l'appareil");
+      if (problem) {
+        const lbl = STATE_FR[op];
+        msgs.push(lbl ? `${lbl} — intervention sur l'appareil` : "Anomalie signalée par l'appareil");
+      }
       if (this._s(c.program_aborted) === "on") msgs.push("Programme interrompu");
       if (running && this._s(c.door) === "on") msgs.push("Porte ouverte pendant le cycle");
       e.alert.querySelector(".msg").textContent = msgs.join(" · ");
       e.alert.classList.toggle("hidden", !msgs.length);
     }
 
+    /* Bandeau à vider */
+    if (e.tofill) {
+      const flag = this._st(c.clean_flag);
+      const on = flag?.state === "on";
+      e.tofill.classList.toggle("hidden", !on);
+      if (on && e.tofillSub)
+        e.tofillSub.textContent = `La vaisselle est propre depuis ${this._ago(flag.last_changed)}`;
+    }
+
     /* Bloc principal */
     const prog = this._num(c.program_progress);
-    const remaining = this._num(c.remaining_time);
-    const startIn = this._num(c.start_in);
+    const remaining = this._remainingMinutes();
+    const startIn = this._startInMinutes();
     const program = this._program();
 
     if (e.stateVal) {
@@ -720,12 +905,12 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (e.stateRight) {
       let r1 = "—";
       let r2 = "";
-      if (op === "DelayedStart" && startIn != null && startIn > 0) {
+      if (delayed && startIn != null && startIn > 0) {
         r1 = this._dur(startIn);
         r2 = "avant départ";
       } else if (running && remaining != null) {
         r1 = this._dur(remaining);
-        r2 = `fin vers ${this._clock(new Date(Date.now() + remaining * 3600 * 1000))}`;
+        r2 = `fin vers ${this._clock(new Date(Date.now() + remaining * 60000))}`;
       } else if (remaining != null && remaining > 0) {
         r1 = this._dur(remaining);
         r2 = "durée estimée";
@@ -746,10 +931,24 @@ class HomeConnectDishwasherCard extends HTMLElement {
       e.progTxt.classList.toggle("hidden", !(running && prog != null));
     }
 
-    /* Étapes du cycle */
+    /* Étapes du cycle. Si l'appareil ne publie pas de phase, on la déduit de
+       la progression via les poids relatifs des étapes. */
     if (e.steps) {
       const cur = this._s(c.program_phase);
-      const idx = PHASES.indexOf(cur);
+      let idx = PHASES.indexOf(cur);
+      if (idx < 0 && running && prog != null) {
+        const w = c.phase_weights || [0.14, 0.44, 0.22, 0.2];
+        const tot = w.reduce((a, b) => a + b, 0);
+        let acc = 0;
+        for (let k = 0; k < PHASES.length; k++) {
+          acc += (w[k] ?? 1) / tot;
+          if (prog / 100 < acc) {
+            idx = k;
+            break;
+          }
+        }
+        if (idx < 0) idx = PHASES.length - 1;
+      }
       e.steps.innerHTML = PHASES.map((p, i) => {
         let cls = "";
         if (idx >= 0 && i < idx) cls = "past";
@@ -779,15 +978,16 @@ class HomeConnectDishwasherCard extends HTMLElement {
     /* Consommables */
     if (e.cons) {
       const row = (key, icon, label) => {
-        const v = this._s(c[key]);
         if (!c[key]) return "";
-        const rank = LEVEL_RANK[v];
-        const cls = rank === 0 ? "bad" : rank === 1 ? "warn" : "ok";
+        const lv = this._level(c[key]);
+        const rank = lv ? lv.rank : null;
+        const cls = rank === 0 ? "bad" : rank === 1 ? "warn" : rank === 2 ? "ok" : "";
         return `<div class="cbox ${cls}" data-e="${c[key]}">
           <svg viewBox="0 0 24 24">${icon}</svg>
           <div class="ct"><div class="cl">${label}</div><div class="cv">${
-            LEVEL_FR[v] || v || "—"
-          }</div></div>
+            lv ? lv.text : "—"
+          }</div>
+          <div class="cbar"><i style="width:${lv ? lv.pct : 0}%"></i></div></div>
         </div>`;
       };
       e.cons.innerHTML = row("salt", ICONS.salt, "Sel régénérant") + row("rinse_aid", ICONS.drop, "Liquide de rinçage");
@@ -814,7 +1014,54 @@ class HomeConnectDishwasherCard extends HTMLElement {
       e.realPower.textContent = p == null ? "—" : `${this._fmt(p, 0)} ${this._st(c.power)?.attributes?.unit_of_measurement || "W"}`;
     }
 
+    this._updateActions(mode);
     this._updateFooter();
+  }
+
+  /** Actions disponibles selon le mode. Les entités indisponibles sont masquées. */
+  _updateActions(mode) {
+    const c = this._config;
+    const e = this._els;
+    if (!e.actions) return;
+    const avail = (id) => !!id && !!this._st(id) && this._st(id).state !== "unavailable";
+
+    const acts = [];
+    if (mode === "run") {
+      if (avail(c.pause_button)) acts.push({ l: "Pause", ghost: true, id: c.pause_button });
+      if (avail(c.stop_button)) acts.push({ l: "Arrêter", ghost: true, id: c.stop_button });
+    } else if (mode === "done") {
+      if (c.clean_flag) acts.push({ l: "Marquer comme vidé", flag: c.clean_flag });
+    } else if (mode === "delayed") {
+      /* Un départ est déjà programmé : proposer « Démarrer » serait ambigu. */
+      if (avail(c.stop_button)) acts.push({ l: "Annuler le départ", ghost: true, id: c.stop_button });
+    } else if (mode === "idle") {
+      if (avail(c.start_button)) acts.push({ l: "Démarrer", id: c.start_button });
+    }
+    /* En mode alerte on n'expose aucune action : l'appareil demande une
+       intervention physique, lui envoyer un ordre n'aurait pas de sens. */
+
+    e.actions.innerHTML = acts
+      .map((a, i) => `<div class="btn${a.ghost ? " ghost" : ""}" data-i="${i}">${a.l}</div>`)
+      .join("");
+    e.actions.classList.toggle("hidden", !acts.length);
+    e.actions.querySelectorAll(".btn").forEach((btn) => {
+      const a = acts[Number(btn.dataset.i)];
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (a.flag) {
+          const d = domainOf(a.flag);
+          this._hass.callService(d === "input_boolean" ? d : "homeassistant", "turn_off", {
+            entity_id: a.flag,
+          });
+        } else if (a.id) {
+          const d = domainOf(a.id);
+          const press = d === "button" || d === "input_button";
+          this._hass.callService(press ? d : "homeassistant", press ? "press" : "turn_on", {
+            entity_id: a.id,
+          });
+        }
+      });
+    });
   }
 
   _updateFooter() {
@@ -881,6 +1128,59 @@ class HomeConnectDishwasherCard extends HTMLElement {
         parts.push(`Aucun cycle sur ${c.hours} h`);
       }
       e.realCycle.textContent = parts.join(" · ");
+    }
+
+    /* Bilan du cycle */
+    if (e.bgrid) {
+      const cycles = this._cycles();
+      const last = cycles.length ? cycles[cycles.length - 1] : null;
+      const open = !!(last && last[2] === true);
+      const running = this._running();
+      const price = this._price();
+
+      let durMin = null;
+      let kwh = null;
+      let source = null;
+      if (last) {
+        durMin = (last[1] - last[0]) / 60000;
+        const r = this._cycleEnergy(last[0], last[1]);
+        if (r) {
+          kwh = r.kwh;
+          source = r.source;
+        }
+      }
+      // entités dédiées si l'intégration en fournit
+      const dedEnergy = this._num(c.cycle_energy);
+      if (dedEnergy != null) {
+        kwh = dedEnergy;
+        source = "appareil";
+      }
+      const dedDur = this._num(c.cycle_duration);
+      if (dedDur != null) durMin = dedDur;
+      const water = this._num(c.cycle_water);
+
+      if (running && !open) {
+        e.bilanK.textContent = "Cycle en cours";
+        e.bilanSrc.textContent = "mesure en attente";
+        durMin = null;
+        kwh = dedEnergy != null ? dedEnergy : null;
+      } else {
+        e.bilanK.textContent = open && running ? "Cycle en cours" : "Dernier cycle";
+        e.bilanSrc.textContent = source ? `source : ${source}` : "";
+      }
+
+      const cells = [
+        { k: "Durée", v: this._dur(durMin) },
+        { k: "Énergie", v: kwh != null ? `${this._fmt(kwh, 2)} kWh` : "—" },
+        { k: "Eau", v: water != null ? `${this._fmt(water, 1)} L` : "—" },
+        {
+          k: "Coût",
+          v: kwh != null && price ? `${this._fmt(kwh * price, 2)} ${c.currency}` : "—",
+        },
+      ];
+      e.bgrid.innerHTML = cells
+        .map((x) => `<div class="bc"><span class="ck">${x.k}</span><span class="cv">${x.v}</span></div>`)
+        .join("");
     }
 
     /* Total cumulé de la prise, en pied de carte */
@@ -977,6 +1277,41 @@ ha-card.is-problem{border-color:rgba(201,143,143,.4);}
 .step.past{color:rgba(143,191,174,.75);border-color:rgba(143,191,174,.22);}
 .step.now{color:var(--dw-info);background:rgba(143,176,201,.14);border-color:rgba(143,176,201,.38);}
 
+/* Bandeau a vider */
+.tofill{margin-top:13px;padding:10px 12px;border-radius:12px;cursor:pointer;
+  display:flex;align-items:center;gap:10px;
+  background:rgba(143,191,174,.09);border:1px solid rgba(143,191,174,.26);}
+.tdot{width:7px;height:7px;border-radius:50%;background:var(--dw-ok);flex-shrink:0;
+  box-shadow:0 0 8px rgba(143,191,174,.5);}
+.ttxt b{display:block;font-size:12px;font-weight:700;color:#cfe4dc;}
+.ttxt .tsub{display:block;font-size:10.5px;color:rgba(255,255,255,.48);margin-top:2px;}
+
+/* Bilan du cycle */
+.bilan{margin-top:16px;}
+.lbl{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px;}
+.bk{font-size:9px;letter-spacing:2px;text-transform:uppercase;
+  color:rgba(255,255,255,.42);font-weight:600;}
+.bsrc{font-size:9px;color:rgba(255,255,255,.3);}
+.bgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
+@media (max-width:340px){.bgrid{grid-template-columns:repeat(2,1fr);}}
+.bc{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.075);
+  border-radius:11px;padding:9px 5px;text-align:center;}
+.ck{display:block;font-size:8px;letter-spacing:.9px;text-transform:uppercase;
+  color:rgba(255,255,255,.38);font-weight:600;}
+.cv{display:block;font-size:13px;font-weight:600;margin-top:5px;
+  font-variant-numeric:tabular-nums;letter-spacing:-.2px;}
+
+/* Actions */
+.actions{display:flex;gap:7px;margin-top:15px;}
+.btn{flex:1;text-align:center;font-size:12px;font-weight:600;padding:11px 0;
+  border-radius:11px;background:rgba(233,238,246,.14);
+  border:1px solid rgba(255,255,255,.22);color:var(--dw-txt);cursor:pointer;transition:.15s;}
+.btn:hover{background:rgba(233,238,246,.2);}
+.btn:active{transform:scale(.985);}
+.btn.ghost{background:rgba(255,255,255,.04);border-color:rgba(255,255,255,.09);
+  color:rgba(255,255,255,.6);}
+.btn.ghost:hover{color:var(--dw-txt);}
+
 /* Programme */
 .prow{margin-top:14px;display:flex;align-items:center;flex-wrap:wrap;gap:6px;}
 .prog-name{font-size:12.5px;font-weight:600;color:rgba(255,255,255,.82);}
@@ -995,6 +1330,11 @@ ha-card.is-problem{border-color:rgba(201,143,143,.4);}
 .cl{font-size:8.5px;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.4);
   font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .cv{font-size:13px;font-weight:600;margin-top:2px;color:rgba(255,255,255,.8);}
+.cbar{margin-top:6px;height:4px;border-radius:2px;background:rgba(255,255,255,.08);overflow:hidden;}
+.cbar > i{display:block;height:100%;border-radius:2px;transition:width .3s;
+  background:rgba(255,255,255,.5);}
+.cbox.warn .cbar > i{background:var(--dw-warn);}
+.cbox.bad .cbar > i{background:var(--dw-bad);}
 .cbox.ok svg{fill:var(--dw-ok);}
 .cbox.warn{background:rgba(223,179,122,.09);border-color:rgba(223,179,122,.3);}
 .cbox.warn svg{fill:var(--dw-warn);}
@@ -1039,9 +1379,11 @@ const FLAT_KEYS = [
   "program_aborted", "salt", "rinse_aid", "energy_forecast", "water_forecast",
   "extra_dry", "half_load", "hygiene_plus", "vario_speed", "silence", "child_lock",
   "power", "energy", "price", "price_entity", "currency", "running_threshold",
+  "clean_flag", "start_button", "pause_button", "stop_button",
+  "cycle_energy", "cycle_water", "cycle_duration", "consumable_warning",
   "hours", "points", "refresh", "show_forecast", "show_options",
 ];
-const MANAGED_KEYS = [...FLAT_KEYS, "type", "program_names"];
+const MANAGED_KEYS = [...FLAT_KEYS, "type", "program_names", "state_map", "consumable_map", "phase_weights", "remaining_unit"];
 
 const LABELS = {
   name: "Nom", area: "Pièce",
@@ -1051,6 +1393,11 @@ const LABELS = {
   start_in: "Départ différé", door: "Porte", connection: "Connexion",
   power_state: "Alimentation de l'appareil", program_aborted: "Programme interrompu",
   salt: "Sel régénérant", rinse_aid: "Liquide de rinçage",
+  clean_flag: "Drapeau « à vider »",
+  start_button: "Bouton Démarrer", pause_button: "Bouton Pause", stop_button: "Bouton Arrêter",
+  cycle_energy: "Énergie du cycle (appareil)", cycle_water: "Eau du cycle (appareil)",
+  cycle_duration: "Durée du cycle (appareil)",
+  consumable_warning: "Seuil d'alerte consommable",
   energy_forecast: "Prévision énergie", water_forecast: "Prévision eau",
   extra_dry: "Séchage +", half_load: "Demi-charge", hygiene_plus: "Hygiène +",
   vario_speed: "VarioSpeed", silence: "Silence", child_lock: "Sécurité enfant",
@@ -1073,6 +1420,12 @@ const HELPERS = {
     "Utilisé seulement en repli, si l'historique de l'état de fonctionnement est indisponible.",
   price_entity:
     "Prend le pas sur le prix fixe. Indispensable sur un contrat à tarif variable comme EDF Tempo.",
+  clean_flag:
+    "input_boolean activé en fin de cycle. Fait apparaître le bandeau « À vider » et le bouton de remise à zéro.",
+  cycle_energy:
+    "Si l'appareil publie déjà l'énergie du cycle, elle prend le pas sur le calcul depuis la prise.",
+  start_button:
+    "Le démarrage à distance exige que l'appareil l'autorise. Le bouton est masqué si l'entité est indisponible.",
 };
 
 const SCHEMA = [
@@ -1099,6 +1452,16 @@ const SCHEMA = [
       { name: "connection", selector: { entity: { filter: [{ domain: "binary_sensor" }] } } },
       { name: "program_aborted", selector: { entity: { filter: [{ domain: "binary_sensor" }] } } },
       { name: "power_state", selector: { entity: { filter: [{ domain: ["sensor", "switch"] }] } } },
+      { name: "clean_flag", selector: { entity: { filter: [{ domain: ["input_boolean", "switch", "binary_sensor"] }] } } },
+      { name: "consumable_warning", selector: { number: { min: 1, max: 90, mode: "box", unit_of_measurement: "%" } } },
+    ],
+  },
+  {
+    type: "expandable", name: "", title: "Actions", icon: "mdi:gesture-tap-button",
+    schema: [
+      { name: "start_button", selector: { entity: { filter: [{ domain: ["button", "script", "scene"] }] } } },
+      { name: "pause_button", selector: { entity: { filter: [{ domain: ["button", "script"] }] } } },
+      { name: "stop_button", selector: { entity: { filter: [{ domain: ["button", "script"] }] } } },
     ],
   },
   {
@@ -1118,6 +1481,9 @@ const SCHEMA = [
     schema: [
       { name: "power", selector: { entity: { filter: [{ domain: "sensor", device_class: "power" }] } } },
       { name: "energy", selector: { entity: { filter: [{ domain: "sensor", device_class: "energy" }] } } },
+      { name: "cycle_energy", selector: { entity: { filter: [{ domain: "sensor" }] } } },
+      { name: "cycle_water", selector: { entity: { filter: [{ domain: "sensor" }] } } },
+      { name: "cycle_duration", selector: { entity: { filter: [{ domain: "sensor" }] } } },
       {
         type: "grid", name: "",
         schema: [

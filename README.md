@@ -9,6 +9,27 @@ que Home Connect ne fournit pas.
 **Lecture seule.** Aucun pilotage, aucun interrupteur d'alimentation : impossible de
 couper un cycle en cours depuis la carte.
 
+## Classification de l'état : table explicite, pas de correspondance floue
+
+Le mode de la carte (`idle`, `delayed`, `run`, `done`, `alert`) vient d'une **table
+explicite** consultée avant toute heuristique, avec les états Home Connect et Miele.
+
+C'est délibéré. Une correspondance par sous-chaîne se trompe : `"inactive"` contient
+`"active"`, `"actionrequired"` contient `"on"`. Une telle approche classe `Inactive` et
+`ActionRequired` en « en marche », et `Ready` en « terminé » si `ready` figure parmi les
+mots de fin — alors que sur Home Connect `Ready` signifie « prêt à démarrer ».
+
+Le repli flou n'intervient que pour les intégrations non répertoriées, n'utilise que des
+mots d'au moins cinq lettres, et teste alerte puis terminé puis repos **avant** marche.
+
+Surcharge possible par `state_map`.
+
+## Le drapeau « à vider » ne masque jamais une alerte
+
+`clean_flag` ne peut requalifier qu'un appareil `idle` ou `done`. Une erreur, un cycle en
+cours ou un départ différé restent visibles. Sans cette garde, une panne resterait
+invisible tant que la vaisselle n'aurait pas été vidée.
+
 ## Le piège que cette carte traite
 
 `remaining_program_time` porte l'attribut `Is Estimated` et **change de sens selon
@@ -113,7 +134,15 @@ hours: 48
 | `connection` | entity | — | Pastille sur l'icône |
 | `power_state` | entity | — | Affiché en pied |
 | `program_aborted` | entity | — | Bandeau d'alerte |
-| `salt` / `rinse_aid` | entity | — | `empty` en rouge, `nearly_empty` en ambre |
+| `salt` / `rinse_aid` | entity | — | Énumération, pourcentage ou binaire. `empty` en rouge |
+| `clean_flag` | entity | — | `input_boolean` de fin de cycle. Bandeau « À vider » et bouton de remise à zéro |
+| `start_button` / `pause_button` / `stop_button` | entity | — | Actions. Masquées si l'entité est indisponible |
+| `cycle_energy` / `cycle_water` / `cycle_duration` | entity | — | Si l'appareil les publie, elles priment sur le calcul depuis la prise |
+| `consumable_warning` | number | `30` | Seuil % d'alerte pour un consommable numérique |
+| `state_map` | objet | `{}` | Surcharge de la table état → mode |
+| `consumable_map` | objet | `{}` | Surcharge des niveaux de consommables |
+| `phase_weights` | liste | `[0.14, 0.44, 0.22, 0.2]` | Poids des phases, pour déduire l'étape sans entité dédiée |
+| `remaining_unit` | string | — | Force l'unité du temps restant |
 | `energy_forecast` / `water_forecast` | entity | — | Pourcentages relatifs |
 | `extra_dry`, `half_load`, `hygiene_plus`, `vario_speed`, `silence`, `child_lock` | entity | — | Options actives, en pastilles |
 | `power` / `energy` | entity | — | Prise mesurante |
@@ -137,6 +166,23 @@ program_names:
   dishcare_dishwasher_program_eco50: Éco silencieux
   favorite_001: Mon favori
 ```
+
+## Consommables : énumérations, pourcentages ou binaires
+
+`_level()` accepte les trois formes. Les énumérations Home Connect
+(`empty` / `nearly_empty` / `full`) sont reconnues explicitement.
+
+C'est le second piège de ce type d'appareil. Un code qui teste `Number(state)` puis
+`state === "on"` retombe sur sa valeur par défaut pour une énumération, et affiche
+« OK » à 100 % alors que le réservoir est **vide**. L'inverse exact de la réalité.
+
+| Valeur du capteur | Affichage | Barre |
+|---|---|---|
+| `empty`, `vide`, `absent` | Vide, rouge | 6 % |
+| `nearly_empty`, `low` | Presque vide, ambre | 28 % |
+| `full`, `ok`, `present` | Plein | 100 % |
+| `on` (capteur de niveau bas) | Vide, rouge | 6 % |
+| nombre | `n %`, seuil `consumable_warning` | `n %` |
 
 ## Licence
 
