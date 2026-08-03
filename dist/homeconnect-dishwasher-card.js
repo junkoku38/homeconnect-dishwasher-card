@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.0.0";
+const CARD_VERSION = "..1";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -66,6 +66,9 @@ const PROGRAM_FR = {
   dishcare_dishwasher_program_quickd: "Rapide",
   dishcare_dishwasher_program_super60: "Super 60 °C",
 };
+
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 const domainOf = (id) => (id ? String(id).split(".")[0] : null);
 
@@ -746,7 +749,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
         <div class="head">
           <div class="halo">${svg(ICONS.dishwasher)}<span class="conn"></span></div>
           <div class="htitle">
-            <div class="hn">${c.name}</div>
+            <div class="hn"></div>
             <div class="hs">—</div>
           </div>
         </div>
@@ -891,9 +894,9 @@ class HomeConnectDishwasherCard extends HTMLElement {
         e.stateVal.innerHTML = `${Math.round(prog)}<span class="u">%</span>`;
       } else {
         e.stateLabel.textContent = program ? (program.active ? "Programme" : "Programme sélectionné") : "État";
-        e.stateVal.innerHTML = `<span class="txt ${problem ? "bad" : finished ? "ok" : ""}">${
+        e.stateVal.innerHTML = `<span class="txt ${problem ? "bad" : finished ? "ok" : ""}">${esc(
           STATE_FR[op] || op || "—"
-        }</span>`;
+        )}</span>`;
       }
     }
 
@@ -971,7 +974,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
       ];
       const on = map
         .filter(([k]) => c[k] && this._s(c[k]) === "on")
-        .map(([k, l]) => `<span class="chip" data-e="${c[k]}">${l}</span>`);
+        .map(([k, l]) => `<span class="chip" data-e="${esc(c[k])}">${esc(l)}</span>`);
       e.opts.innerHTML = on.join("");
     }
 
@@ -982,11 +985,9 @@ class HomeConnectDishwasherCard extends HTMLElement {
         const lv = this._level(c[key]);
         const rank = lv ? lv.rank : null;
         const cls = rank === 0 ? "bad" : rank === 1 ? "warn" : rank === 2 ? "ok" : "";
-        return `<div class="cbox ${cls}" data-e="${c[key]}">
+        return `<div class="cbox ${cls}" data-e="${esc(c[key])}">
           <svg viewBox="0 0 24 24">${icon}</svg>
-          <div class="ct"><div class="cl">${label}</div><div class="cv">${
-            lv ? lv.text : "—"
-          }</div>
+          <div class="ct"><div class="cl">${label}</div><div class="cv">${esc(lv ? lv.text : "—")}</div>
           <div class="cbar"><i style="width:${lv ? lv.pct : 0}%"></i></div></div>
         </div>`;
       };
@@ -998,7 +999,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
       const bar = (key, label) => {
         const v = this._num(c[key]);
         if (v == null) return "";
-        return `<div class="fb" data-e="${c[key]}">
+        return `<div class="fb" data-e="${esc(c[key])}">
           <div class="fl"><span>${label}</span><b>${Math.round(v)} %</b></div>
           <div class="ft"><i style="width:${Math.max(0, Math.min(100, v))}%"></i></div>
         </div>`;
@@ -1586,11 +1587,11 @@ class HomeConnectDishwasherCardEditor extends HTMLElement {
     this._form.schema = SCHEMA;
     this._form.data = this._data();
     const extra = this._unmanaged();
-    this.shadowRoot.querySelector(".note").innerHTML = extra.length
-      ? `<div class="keep">Conservé sans être éditable ici : <b>${extra.join(
-          ", "
-        )}</b>. Passez par l'éditeur YAML pour y toucher.</div>`
-      : "";
+    const note = this.shadowRoot.querySelector(".note");
+    if (extra.length) {
+      note.innerHTML = '<div class="keep">Conservé sans être éditable ici : <b></b>. Passez par l\'éditeur YAML pour y toucher.</div>';
+      note.querySelector("b").textContent = extra.join(", ");
+    } else note.innerHTML = "";
   }
 }
 
