@@ -92,7 +92,7 @@ child_lock: switch.bosch_dishwasher_child_lock
 
 power: sensor.prise_lave_vaisselle_puissance
 energy: sensor.prise_lave_vaisselle
-price: 0.1612
+price_entity: sensor.tarif_actuel_tempo_6kva_ttc
 currency: €
 hours: 48
 ```
@@ -117,7 +117,8 @@ hours: 48
 | `energy_forecast` / `water_forecast` | entity | — | Pourcentages relatifs |
 | `extra_dry`, `half_load`, `hygiene_plus`, `vario_speed`, `silence`, `child_lock` | entity | — | Options actives, en pastilles |
 | `power` / `energy` | entity | — | Prise mesurante |
-| `price` | number | `0.2` | Prix du kWh |
+| `price` | number | `0.2` | Prix du kWh, valeur fixe |
+| `price_entity` | entity | — | Prix dynamique, prend le pas sur `price` |
 | `currency` | string | `€` | Devise |
 | `running_threshold` | number | `20` | Seuil W de repli si l'historique d'état manque |
 | `hours` | number | `12` | Fenêtre d'historique. Monter à 48 pour voir plusieurs cycles |

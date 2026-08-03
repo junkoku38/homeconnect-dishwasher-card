@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "1.0.0";
+const CARD_VERSION = "1.1.0";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -307,6 +307,19 @@ class HomeConnectDishwasherCard extends HTMLElement {
 
   _lang() {
     return this._hass?.locale?.language || "fr";
+  }
+
+  /**
+   * Prix du kWh. Une entité prend le pas sur la valeur fixe : sur un contrat
+   * à tarif variable, un prix figé peut se tromper d'un facteur 5.
+   */
+  _price() {
+    const c = this._config;
+    if (c.price_entity) {
+      const v = this._num(c.price_entity);
+      if (v != null) return v;
+    }
+    return Number(c.price) || 0;
   }
 
   _fmt(v, dec = 2) {
@@ -832,7 +845,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
        cycle, découpé depuis l'historique de `operation_state`. */
     if (e.realCycle) {
       const cycles = this._cycles();
-      const price = Number(c.price) || 0;
+      const price = this._price();
       const parts = [];
       const last = cycles.length ? cycles[cycles.length - 1] : null;
       /* Un segment n'est « en cours » que s'il a été clos par l'instant présent,
@@ -1025,7 +1038,7 @@ const FLAT_KEYS = [
   "program_progress", "remaining_time", "start_in", "door", "connection", "power_state",
   "program_aborted", "salt", "rinse_aid", "energy_forecast", "water_forecast",
   "extra_dry", "half_load", "hygiene_plus", "vario_speed", "silence", "child_lock",
-  "power", "energy", "price", "currency", "running_threshold",
+  "power", "energy", "price", "price_entity", "currency", "running_threshold",
   "hours", "points", "refresh", "show_forecast", "show_options",
 ];
 const MANAGED_KEYS = [...FLAT_KEYS, "type", "program_names"];
@@ -1042,7 +1055,8 @@ const LABELS = {
   extra_dry: "Séchage +", half_load: "Demi-charge", hygiene_plus: "Hygiène +",
   vario_speed: "VarioSpeed", silence: "Silence", child_lock: "Sécurité enfant",
   power: "Puissance mesurée (prise)", energy: "Énergie cumulée (prise)",
-  price: "Prix du kWh", currency: "Devise", running_threshold: "Seuil de cycle actif",
+  price: "Prix du kWh", price_entity: "Entité de prix du kWh", currency: "Devise",
+  running_threshold: "Seuil de cycle actif",
   hours: "Fenêtre d'historique", points: "Échantillons de courbe",
   refresh: "Relecture des données",
   show_forecast: "Afficher les prévisions", show_options: "Afficher les options actives",
@@ -1057,6 +1071,8 @@ const HELPERS = {
     "Home Connect renvoie un pourcentage relatif au maximum de l'appareil, pas des kWh. La carte l'affiche comme tel.",
   running_threshold:
     "Utilisé seulement en repli, si l'historique de l'état de fonctionnement est indisponible.",
+  price_entity:
+    "Prend le pas sur le prix fixe. Indispensable sur un contrat à tarif variable comme EDF Tempo.",
 };
 
 const SCHEMA = [
@@ -1110,6 +1126,7 @@ const SCHEMA = [
           { name: "running_threshold", selector: { number: { min: 1, max: 500, mode: "box", unit_of_measurement: "W" } } },
         ],
       },
+      { name: "price_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
     ],
   },
   {
