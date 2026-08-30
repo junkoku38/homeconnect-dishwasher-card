@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.1.0";
+const CARD_VERSION = "2.2.0";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -144,6 +144,58 @@ const ICONS = {
   alert: `<path d="M12 2 1 21h22L12 2zm0 5 7.5 12.9h-15L12 7zm-1 4v4h2v-4h-2zm0 5v2h2v-2h-2z"/>`,
   clock: `<path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 5h-2v6l5 3 1-1.7-4-2.3V7z"/>`,
   check: `<path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/>`,
+  cart: `<path d="M7 18c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zM1 2v2h2l3.6 7.6-1.4 2.8c-.3.9.4 1.6 1.2 1.6h12v-2H7.1l.9-1.9h7.4c.8 0 1.4-.4 1.7-1l3.6-6.5H7.4L6.3 2H1zm16 16c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>`,
+  trend: `<path d="M16 6l2.3 2.3-4.9 4.9-4-4L2 16.4 3.4 17.8l6-6 4 4 6.3-6.3L22 12V6h-6z"/>`,
+};
+
+/**
+ * Codes erreur Home Connect -> message exploitable. Un code brut « E24 »
+ * n'aide personne ; la cause réelle de la panne si.
+ */
+const ERROR_FR = {
+  e01: "Porte non fermée",
+  e02: "Porte non fermée",
+  e03: "Fuite d'eau détectée",
+  e04: "Fuite d'eau détectée",
+  e08: "Carte électronique",
+  e09: "Capteur de température",
+  e10: "Filtre bouché / vidange",
+  e12: "Arrivée d'eau insuffisante",
+  e13: "Température d'entrée trop élevée",
+  e14: "Température d'entrée trop élevée",
+  e15: "Débitmètre",
+  e16: "Chauffe hors tolérance",
+  e17: "Arrivée d'eau : pression trop basse",
+  e18: "Chauffe : délai dépassé",
+  e21: "Pompe de vidange bloquée",
+  e22: "Filtre bouché / vidange",
+  e24: "Filtre bouché / vidange",
+  e25: "Filtre bouché / vidange",
+  e26: "Capteur de température",
+  e27: "Capteur de pression",
+  e31: "Capteur de pression",
+  e34: "Capteur de température",
+  e36: "Chauffe : relais",
+  e37: "Capteur NTC",
+  e38: "Capteur NTC court-circuit",
+  e39: "Capteur NTC hors tolérance",
+  e42: "Pompe de circulation",
+  e43: "Pompe de circulation",
+  e44: "Débitmètre",
+  e45: "Débitmètre",
+  e47: "Capteur de turbidité",
+  e48: "Capteur de turbidité",
+  e52: "Arrivée d'eau",
+  e59: "Pompe de vidange",
+  e60: "Pompe de circulation",
+  e61: "Pompe de circulation",
+  e69: "Capteur de turbidité",
+  e73: "Interrupteur de porte",
+  e80: "Pompe de circulation",
+  e89: "Pompe de vidange",
+  e90: "Carte électronique",
+  e91: "Carte électronique",
+  e92: "Carte électronique",
 };
 
 const fireEvent = (node, type, detail = {}) => {
@@ -254,6 +306,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
       running_threshold: 20,
       show_forecast: true,
       show_options: true,
+      /** Seuil de dérive kWh/cycle au-delà duquel la tendance passe en rouge. */
+      drift_percent: 15,
       program_names: {},
       ...config,
     };
@@ -399,6 +453,99 @@ class HomeConnectDishwasherCard extends HTMLElement {
       if (v != null) return v;
     }
     return Number(c.price) || 0;
+  }
+
+  /**
+   * Heure locale du prochain changement de tarif, depuis une entité
+   * « Heures creuses (changement) » (rtetempo, EDF). Renvoie null si absente
+   * ou illisible — sans elle, pas de conseil, pas de supposition.
+   */
+  _tariffSwitchAt() {
+    const iso = this._s(this._config.tariff_switch_entity);
+    if (!iso) return null;
+    const t = new Date(iso).getTime();
+    return Number.isNaN(t) ? null : t;
+  }
+
+  /**
+   * Conseil tarifaire au repos : faut-il lancer maintenant ou attendre le
+   * prochain créneau ? Prérequis : prix bas, prix haut, entité heures
+   * creuses, et un état au repos (idle). Renvoie null sinon — on n'affiche
+   * jamais de conseil pendant un cycle : interrompre une vaisselle pour
+   * trois centimes ne se justifie pas.
+   */
+  _tariffAdvice() {
+    const c = this._config;
+    if (this._mode() !== "idle") return null;
+    if (!c.offpeak_entity || !c.price_high_entity) return null;
+    if (!c.price_low_entity && !c.price_entity) return null;
+
+    const offpeak = this._s(c.offpeak_entity);
+    if (offpeak == null || !["on", "off"].includes(offpeak)) return null;
+    const low = c.price_low_entity ? this._num(c.price_low_entity) : null;
+    const high = this._num(c.price_high_entity);
+    if (high == null) return null;
+    const now = this._price();
+    if (now <= 0) return null;
+
+    const durMin = this._remainingMinutes();
+    const kwh = durMin != null && durMin > 0 ? null : null; // durée ≠ énergie, on n'estime pas
+
+    /* En heures creuses : rien à gagner à attendre, on l'indique. */
+    if (offpeak === "on") {
+      return { kind: "cheap", kwh: null };
+    }
+
+    /* En heures pleines : le gain vaut-il l'attente ? */
+    const sw = this._tariffSwitchAt();
+    if (!sw || sw <= Date.now()) return null;
+    const waitMin = (sw - Date.now()) / 60000;
+
+    /* Estimation kWh du programme sélectionné : moyenne des derniers cycles,
+       sinon rien. Un conseil chiffré sur une estimation au doigt mouillé
+       est pire que pas de conseil. */
+    const est = this._avgCycleKwh();
+    if (est == null) {
+      return { kind: "wait-unknown", waitMin, gain: null };
+    }
+    const lowP = low != null ? low : now;
+    const gain = est * (high - lowP);
+    return { kind: gain > 0.05 ? "wait" : "wait-small", waitMin, gain, est };
+  }
+
+  /** Consommation moyenne des cycles complets, en kWh, si assez de mesure. */
+  _avgCycleKwh() {
+    const cycles = this._cycles();
+    const vals = [];
+    for (const seg of cycles) {
+      if (seg[2] === true) continue; // segment ouvert : mesure incomplète
+      const r = this._cycleEnergy(seg[0], seg[1]);
+      if (r && r.kwh > 0.05) vals.push(r.kwh);
+    }
+    if (vals.length < 2) return null;
+    return vals.reduce((a, b) => a + b, 0) / vals.length;
+  }
+
+  /**
+   * Tendance kWh/cycle : valeurs des derniers cycles complets et dérive du
+   * dernier par rapport à la moyenne des précédents. Une dérive à la hausse
+   * signale filtre ou gicleurs encrassés — un lave-vaisselle vieillit en
+   * consommant plus, pas moins.
+   */
+  _trend() {
+    const cycles = this._cycles();
+    const vals = [];
+    for (const seg of cycles) {
+      if (seg[2] === true) continue;
+      const r = this._cycleEnergy(seg[0], seg[1]);
+      if (r && r.kwh > 0.05) vals.push(r.kwh);
+    }
+    if (vals.length < 2) return null;
+    const last = vals[vals.length - 1];
+    const base = vals.slice(0, -1);
+    const avg = base.reduce((a, b) => a + b, 0) / base.length;
+    const drift = avg > 0 ? ((last - avg) / avg) * 100 : null;
+    return { vals, last, avg, drift };
   }
 
   _fmt(v, dec = 2) {
@@ -747,12 +894,22 @@ class HomeConnectDishwasherCard extends HTMLElement {
     e.realPower = $(".real .rp");
     e.realCycle = $(".real .rc");
     e.realSlot = $(".real .slot");
+    e.tariff = $(".tariff");
+    e.tariffTxt = $(".tariff .ttxt");
+    e.trend = $(".trend");
+    e.trendVal = $(".trend .tv");
+    e.trendSlot = $(".trend .tslot");
+    e.trendNote = $(".trend .tnote");
     e.foot = $(".bar");
     e.footLeft = $(".bar .left");
     e.footRight = $(".bar .right");
 
     if (e.halo) e.halo.addEventListener("click", () => this._more(c.operation_state));
     if (e.tofill) e.tofill.addEventListener("click", () => this._more(c.clean_flag));
+    if (e.tariff)
+      e.tariff.addEventListener("click", () => {
+        if (e.tariff.dataset.e) this._more(e.tariff.dataset.e);
+      });
     const hero = $(".hero");
     if (hero) hero.addEventListener("click", () => this._more(c.operation_state));
     this.shadowRoot.querySelectorAll("[data-e]").forEach((el) => {
@@ -823,6 +980,11 @@ class HomeConnectDishwasherCard extends HTMLElement {
             : ""
         }
 
+        <div class="tariff hidden">
+          <span class="tdot"></span>
+          <span class="ttxt"></span>
+        </div>
+
         ${
           c.power
             ? `<div class="real">
@@ -835,6 +997,15 @@ class HomeConnectDishwasherCard extends HTMLElement {
                </div>`
             : ""
         }
+
+        <div class="trend hidden">
+          <div class="thead">
+            <span class="k">Tendance kWh / cycle</span>
+            <span class="tv">—</span>
+          </div>
+          <div class="tslot"></div>
+          <div class="tnote"></div>
+        </div>
 
         <div class="bilan">
           <div class="lbl"><span class="bk">Bilan du cycle</span><span class="bsrc"></span></div>
@@ -889,7 +1060,17 @@ class HomeConnectDishwasherCard extends HTMLElement {
       const msgs = [];
       if (problem) {
         const lbl = STATE_FR[op];
-        msgs.push(lbl ? `${lbl} — intervention sur l'appareil` : "Anomalie signalée par l'appareil");
+        /* Décodage du code erreur si l'état en contient un (E24, e24…).
+           Le code brut n'aide personne ; la cause réelle, si. */
+        const m = String(op || "").match(/e\d{2}/i);
+        const decoded = m ? ERROR_FR[m[0].toLowerCase()] : null;
+        msgs.push(
+          decoded
+            ? `${lbl || "Erreur"} — ${decoded} (code ${m[0].toUpperCase()})`
+            : lbl
+              ? `${lbl} — intervention sur l'appareil`
+              : "Anomalie signalée par l'appareil"
+        );
       }
       if (this._s(c.program_aborted) === "on") msgs.push("Programme interrompu");
       if (running && this._s(c.door) === "on") msgs.push("Porte ouverte pendant le cycle");
@@ -1004,18 +1185,39 @@ class HomeConnectDishwasherCard extends HTMLElement {
 
     /* Consommables */
     if (e.cons) {
-      const row = (key, icon, label) => {
+      const row = (key, icon, label, item) => {
         if (!c[key]) return "";
         const lv = this._level(c[key]);
         const rank = lv ? lv.rank : null;
         const cls = rank === 0 ? "bad" : rank === 1 ? "warn" : rank === 2 ? "ok" : "";
+        const low = rank === 0 || rank === 1;
         return `<div class="cbox ${cls}" data-e="${esc(c[key])}">
           <svg viewBox="0 0 24 24">${icon}</svg>
           <div class="ct"><div class="cl">${label}</div><div class="cv">${esc(lv ? lv.text : "—")}</div>
           <div class="cbar"><i style="width:${lv ? lv.pct : 0}%"></i></div></div>
+          ${
+            low && c.shopping_list
+              ? `<button class="cadd" data-item="${esc(item)}" title="Ajouter à la liste de courses">${ICONS.cart}</button>`
+              : ""
+          }
         </div>`;
       };
-      e.cons.innerHTML = row("salt", ICONS.salt, "Sel régénérant") + row("rinse_aid", ICONS.drop, "Liquide de rinçage");
+      e.cons.innerHTML =
+        row("salt", ICONS.salt, "Sel régénérant", c.shopping_item_salt || "Sel régénérant") +
+        row("rinse_aid", ICONS.drop, "Liquide de rinçage", c.shopping_item_rinse_aid || "Liquide de rinçage");
+      /* Boutons liste de courses : ajout à l'entité todo configurée. */
+      e.cons.querySelectorAll(".cadd").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this._hass.callService("todo", "add_item", {
+            entity_id: c.shopping_list,
+            item: btn.dataset.item,
+          });
+          btn.classList.add("done");
+          btn.innerHTML = ICONS.check;
+          btn.title = "Ajouté";
+        });
+      });
     }
 
     /* Prévisions Home Connect : pourcentages relatifs, pas des kWh ni des litres */
@@ -1032,6 +1234,32 @@ class HomeConnectDishwasherCard extends HTMLElement {
         `<div class="fh">Prévision relative du programme</div>` +
         bar("energy_forecast", "Énergie") +
         bar("water_forecast", "Eau");
+    }
+
+    /* Conseil tarifaire : n'apparaît qu'au repos, avec les entités requises.
+       Le lien `price_entity` reste cliquable pour vérifier le tarif courant. */
+    if (e.tariff) {
+      const adv = this._tariffAdvice();
+      e.tariff.classList.toggle("hidden", !adv);
+      e.tariff.classList.toggle("cheap", adv?.kind === "cheap");
+      if (adv) {
+        let txt;
+        if (adv.kind === "cheap") {
+          txt = `Heures creuses — bon créneau pour lancer`;
+        } else if (adv.kind === "wait") {
+          txt = `Attendre ${this._dur(adv.waitMin)} (fin vers ${this._clock(
+            new Date(Date.now() + adv.waitMin * 60000)
+          )}) économise ~${this._fmt(adv.gain, 2)} ${c.currency} par cycle`;
+        } else if (adv.kind === "wait-small") {
+          txt = `Prochaines heures creuses dans ${this._dur(adv.waitMin)} — gain marginal`;
+        } else {
+          txt = `Heures pleines — prochaines heures creuses dans ${this._dur(adv.waitMin)}`;
+        }
+        e.tariffTxt.textContent = txt;
+        e.tariff.dataset.e = c.price_entity || c.price_low_entity || "";
+      } else {
+        delete e.tariff.dataset.e;
+      }
     }
 
     if (e.realPower) {
@@ -1131,6 +1359,34 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (e.realSlot) {
       const serie = this._series(c.power);
       e.realSlot.innerHTML = buildSpark(serie || [], 342, 34, COL.power, `gD${uid}`);
+    }
+
+    /* Tendance kWh / cycle : sparkline des derniers cycles complets, et
+       dérive du dernier par rapport à la moyenne. Une dérive au-delà du
+       seuil est le signe d'un encrassement, pas d'une variation normale. */
+    if (e.trend) {
+      const tr = this._trend();
+      if (tr) {
+        const drift = tr.drift;
+        const threshold = Number(this._config.drift_percent) || 15;
+        const bad = drift != null && drift >= threshold;
+        const good = drift != null && drift <= -threshold;
+        const color = bad ? COL.bad : good ? COL.ok : COL.info;
+        e.trend.classList.remove("hidden");
+        e.trendVal.textContent = drift != null ? `${drift > 0 ? "+" : ""}${Math.round(drift)} %` : "—";
+        e.trendVal.style.color = color;
+        e.trendSlot.innerHTML = buildSpark(tr.vals, 342, 30, color, `gT${uid}`);
+        const notes = [];
+        notes.push(`moy. ${this._fmt(tr.avg, 2)} kWh · dernier ${this._fmt(tr.last, 2)} kWh`);
+        if (bad)
+          notes.push(
+            `consommation en hausse — vérifier filtre et gicleurs`
+          );
+        else if (good) notes.push(`consommation en baisse`);
+        e.trendNote.textContent = notes.join(" · ");
+      } else {
+        e.trend.classList.add("hidden");
+      }
     }
 
     /* Énergie du cycle : intégration de la puissance sur l'intervalle du
@@ -1407,6 +1663,33 @@ ha-card.is-problem{border-color:rgba(201,143,143,.4);}
 .real .spark{width:100%;height:34px;display:block;margin-top:7px;}
 .rc{font-size:9.5px;color:rgba(255,255,255,.4);margin-top:4px;font-variant-numeric:tabular-nums;}
 
+/* Conseil tarifaire */
+.tariff{margin-top:14px;padding:9px 11px;border-radius:11px;cursor:pointer;
+  display:flex;align-items:center;gap:9px;font-size:11px;line-height:1.45;
+  background:rgba(143,176,201,.09);border:1px solid rgba(143,176,201,.28);color:#bcd0e0;}
+.tariff.cheap{background:rgba(143,191,174,.09);border-color:rgba(143,191,174,.3);color:#cfe4dc;}
+.tariff .tdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;
+  background:var(--dw-info);box-shadow:0 0 8px rgba(143,176,201,.5);}
+.tariff.cheap .tdot{background:var(--dw-ok);box-shadow:0 0 8px rgba(143,191,174,.5);}
+
+/* Bouton ajout liste de courses */
+.cadd{border:none;background:rgba(143,176,201,.14);border-radius:8px;width:28px;height:28px;
+  flex-shrink:0;cursor:pointer;padding:5px;display:flex;align-items:center;justify-content:center;
+  transition:.15s;}
+.cadd svg{width:100%;height:100%;fill:#bcd0e0;}
+.cadd:hover{background:rgba(143,176,201,.28);}
+.cadd.done{background:rgba(143,191,174,.18);}
+.cadd.done svg{fill:var(--dw-ok);}
+
+/* Tendance kWh / cycle */
+.trend{margin-top:14px;}
+.thead{display:flex;align-items:baseline;justify-content:space-between;}
+.thead .k{font-size:9px;letter-spacing:2px;text-transform:uppercase;
+  color:rgba(255,255,255,.42);font-weight:600;}
+.tv{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;}
+.trend .spark{width:100%;height:30px;display:block;margin-top:7px;}
+.tnote{font-size:9.5px;color:rgba(255,255,255,.4);margin-top:4px;}
+
 /* Pied */
 .bar{margin-top:14px;padding-top:11px;border-top:1px solid rgba(255,255,255,.07);
   display:flex;align-items:center;justify-content:space-between;gap:10px;
@@ -1427,6 +1710,8 @@ const FLAT_KEYS = [
   "power", "energy", "price", "price_entity", "currency", "running_threshold",
   "clean_flag", "start_button", "pause_button", "stop_button",
   "cycle_energy", "cycle_water", "cycle_duration", "consumable_warning",
+  "offpeak_entity", "price_low_entity", "price_high_entity", "tariff_switch_entity",
+  "shopping_list", "shopping_item_salt", "shopping_item_rinse_aid", "drift_percent",
   "hours", "points", "refresh", "show_forecast", "show_options",
 ];
 const MANAGED_KEYS = [...FLAT_KEYS, "type", "program_names", "state_map", "consumable_map", "phase_weights", "remaining_unit"];
@@ -1451,6 +1736,12 @@ const LABELS = {
   power: "Puissance mesurée (prise)", energy: "Énergie cumulée (prise)",
   price: "Prix du kWh", price_entity: "Entité de prix du kWh", currency: "Devise",
   running_threshold: "Seuil de cycle actif",
+  offpeak_entity: "Heures creuses (binaire)",
+  price_low_entity: "Prix kWh heures creuses", price_high_entity: "Prix kWh heures pleines",
+  tariff_switch_entity: "Prochain changement de tarif (heure)",
+  shopping_list: "Liste de courses (todo)",
+  shopping_item_salt: "Libellé sel pour la liste", shopping_item_rinse_aid: "Libellé rinçage pour la liste",
+  drift_percent: "Seuil d'alerte de dérive (%)",
   hours: "Fenêtre d'historique", points: "Échantillons de courbe",
   refresh: "Relecture des données",
   show_forecast: "Afficher les prévisions", show_options: "Afficher les options actives",
@@ -1473,6 +1764,14 @@ const HELPERS = {
     "Si l'appareil publie déjà l'énergie du cycle, elle prend le pas sur le calcul depuis la prise.",
   start_button:
     "Le démarrage à distance exige que l'appareil l'autorise. Le bouton est masqué si l'entité est indisponible.",
+  offpeak_entity:
+    "Binaire heures creuses/pleines (ex. rtetempo « Heures creuses »). Avec les deux prix, la carte conseille de lancer ou d'attendre.",
+  tariff_switch_entity:
+    "Capteur horodaté du prochain changement de tarif (ex. rtetempo « Heures Creuses (changement) »). Sans lui, aucun conseil chiffré.",
+  shopping_list:
+    "Entité todo (ex. todo.liste_dachats). Ajoute un bouton « liste de courses » sur un consommable bas.",
+  drift_percent:
+    "Au-delà de cette hausse du kWh du dernier cycle par rapport à la moyenne, la tendance passe en rouge.",
 };
 
 const SCHEMA = [
@@ -1502,6 +1801,14 @@ const SCHEMA = [
       { name: "power_switch", selector: { entity: { filter: [{ domain: ["switch"] }] } } },
       { name: "clean_flag", selector: { entity: { filter: [{ domain: ["input_boolean", "switch", "binary_sensor"] }] } } },
       { name: "consumable_warning", selector: { number: { min: 1, max: 90, mode: "box", unit_of_measurement: "%" } } },
+      { name: "shopping_list", selector: { entity: { filter: [{ domain: ["todo", "input_boolean"] }] } } },
+      {
+        type: "grid", name: "",
+        schema: [
+          { name: "shopping_item_salt", selector: { text: {} } },
+          { name: "shopping_item_rinse_aid", selector: { text: {} } },
+        ],
+      },
     ],
   },
   {
@@ -1541,6 +1848,16 @@ const SCHEMA = [
         ],
       },
       { name: "price_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
+      { name: "drift_percent", selector: { number: { min: 5, max: 100, mode: "box", unit_of_measurement: "%" } } },
+    ],
+  },
+  {
+    type: "expandable", name: "", title: "Conseil tarifaire (heures creuses / pleines)", icon: "mdi:clock-alert-outline",
+    schema: [
+      { name: "offpeak_entity", selector: { entity: { filter: [{ domain: "binary_sensor" }] } } },
+      { name: "tariff_switch_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_datetime"] }] } } },
+      { name: "price_low_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
+      { name: "price_high_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
     ],
   },
   {

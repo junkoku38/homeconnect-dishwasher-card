@@ -119,6 +119,13 @@ currency: €
 hours: 48
 
 power_switch: switch.bosch_dishwasher_power
+
+offpeak_entity: binary_sensor.rte_tempo_heures_creuses
+tariff_switch_entity: sensor.rte_tempo_heures_creuses_changement
+price_low_entity: sensor.tarif_bleu_tempo_heures_creuses_ttc
+price_high_entity: sensor.tarif_bleu_tempo_heures_pleines_ttc
+
+shopping_list: todo.liste_dachats
 ```
 
 ### Options
@@ -157,8 +164,42 @@ power_switch: switch.bosch_dishwasher_power
 | `hours` | number | `12` | Fenêtre d'historique. Monter à 48 pour voir plusieurs cycles |
 | `points` | number | `60` | Échantillons de courbe |
 | `refresh` | number | `120` | Secondes entre deux relectures |
-| `show_forecast` / `show_options` | bool | `true` | Masquer ces blocs |
+ | `show_forecast` / `show_options` | bool | `true` | Masquer ces blocs |
 | `program_names` | objet | `{}` | Surcharge des libellés de programmes |
+| `offpeak_entity` | entity | — | Binaire heures creuses (ex. rtetempo). Active le conseil tarifaire |
+| `price_low_entity` | entity | — | Prix kWh heures creuses |
+| `price_high_entity` | entity | — | Prix kWh heures pleines |
+| `tariff_switch_entity` | entity | — | Capteur horodaté du prochain changement de tarif |
+| `shopping_list` | entity | — | Entité `todo.*`. Bouton « ajouter » sur un consommable bas |
+| `shopping_item_salt` / `shopping_item_rinse_aid` | string | libellés par défaut | Texte ajouté à la liste |
+| `drift_percent` | number | `15` | Hausse kWh du dernier cycle déclenchant l'alerte de tendance |
+
+## Conseil tarifaire
+
+Au repos, si `offpeak_entity`, `price_high_entity` et `tariff_switch_entity`
+sont renseignés, la carte affiche :
+
+- **Heures creuses** — bandeau vert : bon créneau, pas d'attente à conseiller.
+- **Heures pleines, gain chiffré** — « Attendre 3 h 04 économise ~0,28 € par
+  cycle », si la moyenne des kWh/cycle mesurés existe. Sans mesure suffisante,
+  la carte l'écrit au lieu d'inventer un chiffre.
+
+Pendant un cycle, aucun conseil : interrompre une vaisselle pour trois
+centimes ne se justifie pas. Le bandeau est cliquable et ouvre le tarif courant.
+
+## Tendance kWh / cycle
+
+Un sparkline des kWh des derniers cycles complets, et la dérive du dernier
+par rapport à la moyenne des précédents. Une dérive ≥ `drift_percent` passe
+en rouge avec la mention « vérifier filtre et gicleurs » : un
+lave-vaisselle vieillit en consommant plus (calcaire, encrassement), pas
+moins. Deux cycles complets minimum, sinon le bloc reste masqué.
+
+## Codes erreur
+
+Les états Home Connect de la forme `E24`, `e09`… sont décodés dans le bandeau
+d'alerte : `E24 — Filtre bouché / vidange (code E24)`. Un code brut n'aide
+personne pendant une panne ; la cause, si.
 
 ### Programmes
 
