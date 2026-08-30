@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.5.1";
+const CARD_VERSION = "2.5.2";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -1145,14 +1145,29 @@ class HomeConnectDishwasherCard extends HTMLElement {
       e.tariff.addEventListener("click", () => {
         if (e.tariff.dataset.e) this._more(e.tariff.dataset.e);
       });
-    /* Sélecteur de programme : applique le choix sur l'entité select. */
-    if (e.progSel)
+    /* Sélecteur de programme : applique le choix sur l'entité select.
+       focus/blur suit l'état ouvert du menu déroulant — pendant ce temps,
+       _update() s'interdit de modifier le sélecteur. */
+    if (e.progSel) {
+      e.progSel.addEventListener("focus", () => {
+        this._progMenuOpen = true;
+      });
+      e.progSel.addEventListener("blur", () => {
+        this._progMenuOpen = false;
+      });
+      /* Mobile : focus peut arriver après l'ouverture du menu. pointerdown
+         précède l'ouverture partout ; on le prend comme début d'interaction. */
+      e.progSel.addEventListener("pointerdown", () => {
+        this._progMenuOpen = true;
+      });
       e.progSel.addEventListener("change", () => {
+        this._progMenuOpen = false;
         this._hass.callService("select", "select_option", {
           entity_id: this._config.selected_program,
           option: e.progSel.value,
         });
       });
+    }
     const hero = $(".hero");
     if (hero) hero.addEventListener("click", () => this._more(c.operation_state));
     this.shadowRoot.querySelectorAll("[data-e]").forEach((el) => {
@@ -1444,23 +1459,30 @@ class HomeConnectDishwasherCard extends HTMLElement {
       selState.attributes.options.length > 0;
     const canSelect = !running && !delayed && !problem && selAvailable;
     if (e.progSelWrap) {
-      e.progSelWrap.classList.toggle("hidden", !canSelect);
-      if (e.progName) e.progName.classList.toggle("hidden", canSelect);
-      if (canSelect && e.progSel) {
-        const opts = selState.attributes.options;
-        if (this._selOptsKey !== opts.join("|") || this._selOptsVal !== selState.state) {
-          this._selOptsKey = opts.join("|");
-          this._selOptsVal = selState.state;
-          e.progSel.innerHTML = opts
-            .map(
-              (o) =>
-                `<option value="${esc(o)}"${o === selState.state ? " selected" : ""}>${esc(
-                  this._programNames[o] || o
-                )}</option>`
-            )
-            .join("");
+      /* Le menu déroulant natif est ouvert : ne surtout rien lui toucher.
+         Reconstruire les <option> ou masquer le wrap refermerait le menu
+         sous le curseur de l'utilisateur — c'est le bug du select qui se
+         referme avant le clic. On retente à la prochaine mise à jour. */
+      const menuOpen = this._progMenuOpen === true;
+      if (!menuOpen) {
+        e.progSelWrap.classList.toggle("hidden", !canSelect);
+        if (e.progName) e.progName.classList.toggle("hidden", canSelect);
+        if (canSelect && e.progSel) {
+          const opts = selState.attributes.options;
+          if (this._selOptsKey !== opts.join("|") || this._selOptsVal !== selState.state) {
+            this._selOptsKey = opts.join("|");
+            this._selOptsVal = selState.state;
+            e.progSel.innerHTML = opts
+              .map(
+                (o) =>
+                  `<option value="${esc(o)}"${o === selState.state ? " selected" : ""}>${esc(
+                    this._programNames[o] || o
+                  )}</option>`
+              )
+              .join("");
+          }
+          e.progSel.disabled = false;
         }
-        e.progSel.disabled = false;
       }
     }
     if (e.progName) e.progName.textContent = program ? program.label : "—";
@@ -1621,11 +1643,13 @@ class HomeConnectDishwasherCard extends HTMLElement {
     /* En mode alerte on n'expose aucune action : l'appareil demande une
        intervention physique, lui envoyer un ordre n'aurait pas de sens. */
 
-    /* Les boutons remplacés, le sélecteur (premier enfant) est préservé :
-       il est reconstruit dans _update(), pas ici. */
+    /* Les boutons sont remplacés, le sélecteur est conservé en place :
+       le détacher fermerait le menu déroulant ouvert. On ne le touche
+       jamais ici ; sa visibilité est gérée dans _update(). */
     const selWrap = e.actions.querySelector(".prog-selwrap");
-    e.actions.innerHTML = "";
-    if (selWrap) e.actions.appendChild(selWrap);
+    /* retirer uniquement les boutons, en laissant le sélecteur en place */
+    e.actions.querySelectorAll(".btn").forEach((b) => b.remove());
+    const frag = document.createDocumentFragment();
     acts
       .map((a, i) => {
         const el = document.createElement("div");
@@ -1634,7 +1658,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
         el.textContent = a.l;
         return el;
       })
-      .forEach((el) => e.actions.appendChild(el));
+      .forEach((el) => frag.appendChild(el));
+    e.actions.appendChild(frag);
     e.actions.classList.toggle("hidden", !acts.length && !(selWrap && !selWrap.classList.contains("hidden")));
     e.actions.querySelectorAll(".btn").forEach((btn) => {
       const a = acts[Number(btn.dataset.i)];
