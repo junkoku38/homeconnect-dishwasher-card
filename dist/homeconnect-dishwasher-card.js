@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.3.0";
+const CARD_VERSION = "2.3.1";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -1637,22 +1637,36 @@ class HomeConnectDishwasherCard extends HTMLElement {
       }
     }
 
-    /* Stats par programme */
+    /* Stats par programme. Tous les programmes que l'appareil expose
+       (options du select) sont listés ; ceux sans mesure dans la fenêtre
+       affichent « pas encore de mesure » — c'est l'information utile :
+       savoir ce qui n'a jamais été vérifié, pas le cacher. */
     if (e.pstats) {
       const stats = this._programStats();
       const grade = this._ecoGrade();
       if (stats && stats.size) {
         e.pstats.classList.remove("hidden");
-        const rows = [...stats.entries()]
-          .sort((a, b) => b[1].kwh - a[1].kwh)
-          .map(([prog, st]) => {
+        /* catalogue complet depuis le select, sinon les seuls mesurés */
+        const opts = this._st(c.selected_program)?.attributes?.options;
+        const progs = Array.isArray(opts) && opts.length
+          ? [...new Set([...opts, ...stats.keys()])]
+          : [...stats.keys()];
+        const rows = progs
+          .map((prog) => {
+            const st = stats.get(prog);
             const label = this._programNames[prog] || prog;
             const hot = grade && grade.prog === prog;
-            return `<div class="prow2${hot ? " hot" : ""}">
-              <span class="pn">${esc(label)}</span>
-              <span class="pv">${this._fmt(st.avg, 2)} kWh<span class="pn2"> · ${st.n}×</span></span>
-            </div>`;
+            return { label, st, hot, kwh: st ? st.kwh : 0 };
           })
+          .sort((a, b) => b.kwh - a.kwh)
+          .map(({ label, st, hot }) => `<div class="prow2${hot ? " hot" : ""}${st ? "" : " unmeasured"}">
+            <span class="pn">${esc(label)}</span>
+            <span class="pv">${
+              st
+                ? `${this._fmt(st.avg, 2)} kWh<span class="pn2"> · ${st.n}×</span>`
+                : `<span class="pn2">pas encore de mesure</span>`
+            }</span>
+          </div>`)
           .join("");
         const gradeHtml = grade
           ? `<div class="grade ${grade.grade <= "B" ? "ok" : grade.grade >= "D" ? "bad" : ""}" title="Écart à la moyenne de ce programme : ${grade.dev > 0 ? "+" : ""}${Math.round(grade.dev)} %">Note ${grade.grade}</div>`
@@ -2044,6 +2058,7 @@ ha-card.is-problem{border-color:rgba(201,143,143,.4);}
 .prow2 .pv{font-variant-numeric:tabular-nums;flex-shrink:0;color:rgba(255,255,255,.85);}
 .prow2 .pn2{color:rgba(255,255,255,.38);font-size:10px;}
 .prow2.hot .pn2{color:var(--dw-info);}
+.prow2.unmeasured .pn,.prow2.unmeasured .pv{color:rgba(255,255,255,.32);font-weight:400;}
 .grade{margin-top:8px;padding:6px 10px;border-radius:8px;font-size:10.5px;font-weight:700;
   text-align:center;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);
   color:rgba(255,255,255,.75);}

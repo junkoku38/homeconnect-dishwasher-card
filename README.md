@@ -221,6 +221,11 @@ La carte croise l'historique d'`active_program` avec la découpe de cycles :
 chaque cycle est attribué au programme qui couvre le plus long segment de son
 intervalle. Résultat : « Eco 50 °C : 0,92 kWh · 12× ».
 
+**Tous les programmes de l'appareil sont listés** (options du
+`selected_program`), pas seulement les mesurés : ceux sans cycle dans la
+fenêtre affichent « pas encore de mesure » — savoir ce qui n'a jamais été
+vérifié est l'information utile. Les mesurés sont triés en premier.
+
 La **note éco** (A–E) compare le dernier cycle à la moyenne de **son propre
 programme** — Eco 50 contre Intensif 70 serait absurde. ±5 % autour de la
 moyenne donne B/C/D, au-delà A ou E. Il faut au moins deux cycles mesurés du
