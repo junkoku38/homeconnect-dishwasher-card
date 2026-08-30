@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.0.1";
+const CARD_VERSION = "2.1.0";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -294,10 +294,24 @@ class HomeConnectDishwasherCard extends HTMLElement {
       active_program: same(/active_program$/, "sensor."),
       selected_program: same(/selected_program$/, "select."),
       program_phase: same(/program_phase$/, "sensor."),
+      start_in: same(/start_in$/, "sensor."),
       door: same(/_door$/, "binary_sensor."),
       salt: same(/_salt$/, "sensor."),
       rinse_aid: same(/rinse_aid$/, "sensor."),
       connection: same(/_connection$/, "binary_sensor."),
+      program_aborted: same(/program_aborted$/, "binary_sensor."),
+      energy_forecast: same(/energy_forecast$/, "sensor."),
+      water_forecast: same(/water_forecast$/, "sensor."),
+      power_state: same(/power_state$/, "sensor."),
+      power_switch: same(/_power$/, "switch."),
+      start_button: same(/_start$/, "button."),
+      stop_button: same(/_abort$/, "button."),
+      extra_dry: same(/extra_dry$/, "switch."),
+      half_load: same(/half_load$/, "switch."),
+      hygiene_plus: same(/hygiene_plus$/, "switch."),
+      vario_speed: same(/variospeedplus$/, "switch."),
+      silence: same(/silence_on_demand$/, "switch."),
+      child_lock: same(/child_lock$/, "switch."),
     };
     Object.keys(cfg).forEach((k) => cfg[k] === undefined && delete cfg[k]);
     const d = hass.devices?.[dev];
@@ -315,6 +329,16 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (c.show_forecast && (c.energy_forecast || c.water_forecast)) n += 1;
     if (c.power) n += 3;
     return n;
+  }
+
+  /* Dashboards modernes (sections) : la carte remplira sa colonne. */
+  getGridOptions() {
+    const c = this._config || {};
+    let rows = 5;
+    if (c.salt || c.rinse_aid) rows += 1;
+    if (c.show_forecast && (c.energy_forecast || c.water_forecast)) rows += 1;
+    if (c.power) rows += 3;
+    return { columns: 12, min_rows: 3, max_rows: rows };
   }
 
   /* ---------- Cycle de vie ---------- */
@@ -1037,6 +1061,13 @@ class HomeConnectDishwasherCard extends HTMLElement {
       if (avail(c.stop_button)) acts.push({ l: "Annuler le départ", ghost: true, id: c.stop_button });
     } else if (mode === "idle") {
       if (avail(c.start_button)) acts.push({ l: "Démarrer", id: c.start_button });
+      /* Interrupteur Marche/Veille (Home Connect local l'expose) :
+         allumer l'appareil pour pouvoir choisir un programme, ou le
+         mettre en veille s'il traîne allumé sans cycle. */
+      if (avail(c.power_switch)) {
+        const on = this._s(c.power_switch) === "on";
+        acts.push({ l: on ? "Veille" : "Allumer", ghost: true, id: c.power_switch, turn: !on });
+      }
     }
     /* En mode alerte on n'expose aucune action : l'appareil demande une
        intervention physique, lui envoyer un ordre n'aurait pas de sens. */
@@ -1056,10 +1087,15 @@ class HomeConnectDishwasherCard extends HTMLElement {
           });
         } else if (a.id) {
           const d = domainOf(a.id);
-          const press = d === "button" || d === "input_button";
-          this._hass.callService(press ? d : "homeassistant", press ? "press" : "turn_on", {
-            entity_id: a.id,
-          });
+          if (a.turn != null) {
+            /* switch Marche/Veille : on impose l'état voulu */
+            this._hass.callService(d, a.turn ? "turn_on" : "turn_off", { entity_id: a.id });
+          } else {
+            const press = d === "button" || d === "input_button";
+            this._hass.callService(press ? d : "homeassistant", press ? "press" : "turn_on", {
+              entity_id: a.id,
+            });
+          }
         }
       });
     });
@@ -1071,7 +1107,15 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (!e.footLeft) return;
     const bits = [];
     if (c.door) bits.push(this._s(c.door) === "on" ? "Porte ouverte" : "Porte fermée");
-    if (c.power_state) bits.push(this._s(c.power_state) === "on" ? "Sous tension" : "Hors tension");
+    /* Alimentation : power_state peut être un binaire (on/off) ou un
+       capteur texte Home Connect (on/off/Off) ; power_switch est un
+       vrai switch — le plus fiable des deux quand il existe. */
+    const psw = this._s(c.power_switch);
+    const pstate = norm(this._s(c.power_state) ?? "");
+    let powered;
+    if (psw != null) powered = psw === "on";
+    else if (pstate) powered = ["on", "sous_tension", "active"].includes(pstate);
+    if (powered != null) bits.push(powered ? "Sous tension" : "Hors tension");
     e.footLeft.textContent = bits.join(" · ");
     if (!e.footRight.textContent) e.footRight.textContent = "";
   }
@@ -1379,6 +1423,7 @@ const FLAT_KEYS = [
   "program_progress", "remaining_time", "start_in", "door", "connection", "power_state",
   "program_aborted", "salt", "rinse_aid", "energy_forecast", "water_forecast",
   "extra_dry", "half_load", "hygiene_plus", "vario_speed", "silence", "child_lock",
+  "power_switch",
   "power", "energy", "price", "price_entity", "currency", "running_threshold",
   "clean_flag", "start_button", "pause_button", "stop_button",
   "cycle_energy", "cycle_water", "cycle_duration", "consumable_warning",
@@ -1393,6 +1438,7 @@ const LABELS = {
   program_progress: "Progression", remaining_time: "Temps restant ou durée estimée",
   start_in: "Départ différé", door: "Porte", connection: "Connexion",
   power_state: "Alimentation de l'appareil", program_aborted: "Programme interrompu",
+  power_switch: "Interrupteur Marche/Veille (switch.power)",
   salt: "Sel régénérant", rinse_aid: "Liquide de rinçage",
   clean_flag: "Drapeau « à vider »",
   start_button: "Bouton Démarrer", pause_button: "Bouton Pause", stop_button: "Bouton Arrêter",
@@ -1453,6 +1499,7 @@ const SCHEMA = [
       { name: "connection", selector: { entity: { filter: [{ domain: "binary_sensor" }] } } },
       { name: "program_aborted", selector: { entity: { filter: [{ domain: "binary_sensor" }] } } },
       { name: "power_state", selector: { entity: { filter: [{ domain: ["sensor", "switch"] }] } } },
+      { name: "power_switch", selector: { entity: { filter: [{ domain: ["switch"] }] } } },
       { name: "clean_flag", selector: { entity: { filter: [{ domain: ["input_boolean", "switch", "binary_sensor"] }] } } },
       { name: "consumable_warning", selector: { number: { min: 1, max: 90, mode: "box", unit_of_measurement: "%" } } },
     ],
@@ -1615,11 +1662,14 @@ if (!customElements.get("homeconnect-dishwasher-card")) {
 }
 
 window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "homeconnect-dishwasher-card",
-  name: "Home Connect Dishwasher Card",
-  description:
-    "Lave-vaisselle Bosch / Siemens / Neff : suivi de cycle, phases, consommables, et consommation réelle mesurée par une prise. Lecture seule.",
-  preview: true,
-  documentationURL: "https://github.com/junkoku38/homeconnect-dishwasher-card",
-});
+/* pas de doublon si le bundle est chargé deux fois (cache + rechargement) */
+if (!window.customCards.some((c) => c?.type === "homeconnect-dishwasher-card")) {
+  window.customCards.push({
+    type: "homeconnect-dishwasher-card",
+    name: "Home Connect Dishwasher Card",
+    description:
+      "Lave-vaisselle Bosch / Siemens / Neff : suivi de cycle, phases, consommables, et consommation réelle mesurée par une prise.",
+    preview: true,
+    documentationURL: "https://github.com/junkoku38/homeconnect-dishwasher-card",
+  });
+}

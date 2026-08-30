@@ -6,8 +6,9 @@ Carte Lovelace pour lave-vaisselle Bosch, Siemens ou Neff, via l'intégration of
 Suivi de cycle, phases, consommables, et **consommation réelle mesurée par une prise** —
 que Home Connect ne fournit pas.
 
-**Lecture seule.** Aucun pilotage, aucun interrupteur d'alimentation : impossible de
-couper un cycle en cours depuis la carte.
+**Lecture du cycle seule.** Aucun pilotage de programme : la carte n'interrompt
+pas un cycle en cours. Seule exception : l'interrupteur Marche/Veille
+(`power_switch`) permet d'allumer l'appareil ou de le mettre en veille au repos.
 
 ## Classification de l'état : table explicite, pas de correspondance floue
 
@@ -116,6 +117,8 @@ energy: sensor.prise_lave_vaisselle
 price_entity: sensor.tarif_actuel_tempo_6kva_ttc
 currency: €
 hours: 48
+
+power_switch: switch.bosch_dishwasher_power
 ```
 
 ### Options
@@ -132,7 +135,8 @@ hours: 48
 | `start_in` | entity | — | Départ différé |
 | `door` | entity | — | Alerte si ouverte pendant un cycle |
 | `connection` | entity | — | Pastille sur l'icône |
-| `power_state` | entity | — | Affiché en pied |
+| `power_state` | entity | — | Affiché en pied (binaire **ou** texte Home Connect `on`/`off`) |
+| `power_switch` | entity | — | Interrupteur Marche/Veille (`switch.*_power`). Pied + boutons « Allumer »/« Veille » au repos |
 | `program_aborted` | entity | — | Bandeau d'alerte |
 | `salt` / `rinse_aid` | entity | — | Énumération, pourcentage ou binaire. `empty` en rouge |
 | `clean_flag` | entity | — | `input_boolean` de fin de cycle. Bandeau « À vider » et bouton de remise à zéro |
