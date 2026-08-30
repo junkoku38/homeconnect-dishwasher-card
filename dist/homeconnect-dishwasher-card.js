@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.3.1";
+const CARD_VERSION = "2.4.0";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -586,13 +586,21 @@ class HomeConnectDishwasherCard extends HTMLElement {
         }
       }
       if (!best) continue;
-      const cur = map.get(best) || { n: 0, kwh: 0 };
+      const cur = map.get(best) || { n: 0, kwh: 0, liters: 0 };
       cur.n += 1;
       cur.kwh += r.kwh;
+      const w = this._cycleWater(seg[0], seg[1]);
+      if (w) {
+        cur.liters += w.liters;
+        cur.waterN = (cur.waterN || 0) + 1;
+      }
       map.set(best, cur);
     }
     if (!map.size) return null;
-    for (const v of map.values()) v.avg = v.kwh / v.n;
+    for (const v of map.values()) {
+      v.avg = v.kwh / v.n;
+      v.avgLiters = v.waterN ? v.liters / v.waterN : null;
+    }
     return map;
   }
 
@@ -681,6 +689,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
     const colors = new Map(); // couleur -> kWh
     let n = 0;
     let kwh = 0;
+    let liters = 0;
     for (const seg of cycles) {
       if (seg[2] === true) continue;
       if (seg[1] < monthStart.getTime()) continue;
@@ -688,6 +697,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
       if (!r || r.kwh <= 0.05) continue;
       n += 1;
       kwh += r.kwh;
+      const w = this._cycleWater(seg[0], seg[1]);
+      if (w) liters += w.liters;
       if (hist.length) {
         /* couleur au milieu du cycle */
         const mid = (seg[0] + seg[1]) / 2;
@@ -701,7 +712,35 @@ class HomeConnectDishwasherCard extends HTMLElement {
     }
     if (!n) return null;
     const price = this._price();
-    return { n, kwh, cost: price ? kwh * price : null, colors };
+    return { n, kwh, cost: price ? kwh * price : null, liters, colors };
+  }
+
+  /**
+   * Eau du cycle : si l'appareil publie une valeur dédiée (`cycle_water`),
+   * elle prime. Sinon, delta d'un compteur d'eau totalisant (`water_meter`)
+   * sur l'intervalle du cycle — même logique que l'énergie de la prise.
+   * Renvoie null sans l'un des deux : on n'invente pas de litres.
+   */
+  _cycleWater(from, to) {
+    const c = this._config;
+    const ded = this._num(c.cycle_water);
+    if (ded != null) return { liters: ded, source: "appareil" };
+    if (!c.water_meter) return null;
+    const s = this._samples(c.water_meter);
+    if (!s.length) return null;
+    const unit = norm(this._st(c.water_meter)?.attributes?.unit_of_measurement || "l");
+    const k = ["m3", "m³"].includes(unit) ? 1000 : unit === "hl" ? 100 : 1;
+    let a = null;
+    let b = null;
+    for (const [ts, val] of s) {
+      if (ts <= from) a = val;
+      if (ts <= to) b = val;
+      if (ts > to) break;
+    }
+    if (a == null || b == null) return null;
+    const d = (b - a) * k;
+    if (d < 0) return null; // remise à zéro du compteur
+    return { liters: d, source: "compteur" };
   }
 
   /**
@@ -887,7 +926,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
 
   async _fetch() {
     const c = this._config;
-    const ids = [c.power, c.energy, c.operation_state, c.active_program].filter(Boolean);
+    const ids = [c.power, c.energy, c.operation_state, c.active_program, c.water_meter].filter(Boolean);
     if (!ids.length || !this._hass || this._busy) return;
     this._busy = true;
     try {
@@ -1663,7 +1702,9 @@ class HomeConnectDishwasherCard extends HTMLElement {
             <span class="pn">${esc(label)}</span>
             <span class="pv">${
               st
-                ? `${this._fmt(st.avg, 2)} kWh<span class="pn2"> · ${st.n}×</span>`
+                ? `${this._fmt(st.avg, 2)} kWh<span class="pn2"> · ${st.n}×</span>${
+                    st.avgLiters ? `<span class="pn2"> · ${this._fmt(st.avgLiters, 0)} L</span>` : ""
+                  }`
                 : `<span class="pn2">pas encore de mesure</span>`
             }</span>
           </div>`)
@@ -1684,6 +1725,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
         e.monthly.classList.remove("hidden");
         e.monthlyVal.textContent =
           `${m.n} cycle${m.n > 1 ? "s" : ""} · ${this._fmt(m.kwh, 1)} kWh` +
+          (m.liters ? ` · ${this._fmt(m.liters, 0)} L` : "") +
           (m.cost != null ? ` · ${this._fmt(m.cost, 2)} ${this._config.currency}` : "");
         const TEMPO_COLOR = { bleu: "#4f8fe0", blanc: "#d9d9d9", rouge: "#c95f5f" };
         const parts = [];
@@ -1816,7 +1858,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
       }
       const dedDur = this._num(c.cycle_duration);
       if (dedDur != null) durMin = dedDur;
-      const water = this._num(c.cycle_water);
+      const waterR = last ? this._cycleWater(last[0], last[1]) : null;
+      const water = waterR ? waterR.liters : null;
 
       if (running && !open) {
         e.bilanK.textContent = "Cycle en cours";
@@ -2127,7 +2170,7 @@ const FLAT_KEYS = [
   "shopping_list", "shopping_item_salt", "shopping_item_rinse_aid", "drift_percent",
   "filter_counter", "filter_warning", "tabs_entity", "tabs_low",
   "optimized_start", "notify_service", "remind_after", "remind_message",
-  "tempo_color_entity",
+  "tempo_color_entity", "water_meter",
   "hours", "points", "refresh", "show_forecast", "show_options",
 ];
 const MANAGED_KEYS = [...FLAT_KEYS, "type", "program_names", "state_map", "consumable_map", "phase_weights", "remaining_unit"];
@@ -2167,6 +2210,7 @@ const LABELS = {
   remind_after: "Rappel à vider après (heures)",
   remind_message: "Message du rappel",
   tempo_color_entity: "Couleur Tempo (capteur)",
+  water_meter: "Compteur d'eau totalisant (capteur)",
   hours: "Fenêtre d'historique", points: "Échantillons de courbe",
   refresh: "Relecture des données",
   show_forecast: "Afficher les prévisions", show_options: "Afficher les options actives",
@@ -2207,6 +2251,8 @@ const HELPERS = {
     "Service de notification pour le rappel « à vider », ex. notify.mobile_app_paul. Format service complet.",
   remind_after:
     "Le bouton « Me le rappeler » n'apparaît que si la vaisselle est propre depuis ce nombre d'heures.",
+  water_meter:
+    "Capteur totalisant les litres (impulsions, reed, débitmètre cumulé). La carte calcule le delta par cycle — Home Connect ne publie pas de litres.",
 };
 
 const SCHEMA = [
@@ -2302,6 +2348,7 @@ const SCHEMA = [
       },
       { name: "price_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
       { name: "drift_percent", selector: { number: { min: 5, max: 100, mode: "box", unit_of_measurement: "%" } } },
+      { name: "water_meter", selector: { entity: { filter: [{ domain: "sensor", device_class: ["water", "volume"] }] } } },
     ],
   },
   {

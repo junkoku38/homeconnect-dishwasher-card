@@ -175,7 +175,8 @@ remind_after: 4
 | `price_low_entity` | entity | — | Prix kWh heures creuses |
 | `price_high_entity` | entity | — | Prix kWh heures pleines |
 | `tariff_switch_entity` | entity | — | Capteur horodaté du prochain changement de tarif |
-| `tempo_color_entity` | entity | — | Capteur couleur Tempo. Répartition des kWh par couleur ce mois-ci |
+ | `tempo_color_entity` | entity | — | Capteur couleur Tempo. Répartition des kWh par couleur ce mois-ci |
+| `water_meter` | entity | — | Compteur d'eau totalisant (litres ou m³). Delta par cycle, comme la prise |
 | `shopping_list` | entity | — | Entité `todo.*`. Bouton « ajouter » sur un consommable bas |
 | `shopping_item_salt` / `shopping_item_rinse_aid` | string | libellés par défaut | Texte ajouté à la liste |
 | `drift_percent` | number | `15` | Hausse kWh du dernier cycle déclenchant l'alerte de tendance |
@@ -237,6 +238,47 @@ Au repos, si le programme sélectionné a un historique mesuré :
 « ≈ 0,15 € (0,92 kWh × 0,1654 €, 12 cycles mesurés) ». Moyenne kWh du
 programme × tarif courant. Sans historique de ce programme, aucune
 estimation — afficher un chiffre inventé serait pire.
+
+## Consommation d'eau
+
+Home Connect ne publie **pas** de litres : `water_forecast` est un
+pourcentage relatif (40 %), affiché comme tel. Pour de vrais litres, la
+carte calcule le **delta d'un compteur d'eau totalisant** (`water_meter`)
+sur l'intervalle de chaque cycle — exactement la méthode retenue pour
+l'énergie de la prise, pour les mêmes raisons de précision. Unités `l`,
+`m³` et `hl` reconnues ; remise à zéro détectée (delta négatif ignoré).
+
+Résultat visible au trois endroits : bilan du cycle (Eau), moyenne par
+programme (`0,92 kWh · 12× · 11 L`), cumul mensuel.
+
+**Mesurer l'eau physiquement** — un lave-vaisselle ne donne pas cette
+information :
+
+| Solution | Coût | Précision |
+|---|---|---|
+| Compteur d'eau à impulsions (reed) + ESPHome sur l'arrivée d'eau dédiée | ~15-25 € | Excellente |
+| Débitmètre YF-B10 + ESPHome (cumul dans un `total`) | ~10 € | ±5 % |
+| Caméra sur le compteur d'eau existant | 0 € | Variable |
+
+Exemple ESPHome pour un compteur à impulsions (1 impulsion = 1 L) :
+
+```yaml
+sensor:
+  - platform: pulse_counter
+    pin: GPIO5
+    name: "Lave-vaisselle : impulsions eau"
+    unit_of_measurement: "L/min"
+    filters:
+      - multiply: 1.0
+  - platform: integration
+    source: lave_vaisselle_impulsions_eau
+    name: "Lave-vaisselle : eau totale"
+    unit_of_measurement: "L"
+    time_unit: min
+    restore: true
+```
+
+La carte consomme directement le capteur totalisant.
 
 ## Filtre et pastilles
 
