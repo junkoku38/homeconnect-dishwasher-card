@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.5.0";
+const CARD_VERSION = "2.5.1";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -1210,9 +1210,6 @@ class HomeConnectDishwasherCard extends HTMLElement {
 
         <div class="prow">
           <span class="prog-name">—</span>
-          <div class="prog-selwrap hidden">
-            <select class="prog-select"></select>
-          </div>
           ${c.show_options ? `<span class="opts"></span>` : ""}
         </div>
         <div class="probcost hidden"></div>`
@@ -1276,7 +1273,11 @@ class HomeConnectDishwasherCard extends HTMLElement {
           <div class="bgrid"></div>
         </div>
 
-        <div class="actions hidden"></div>
+        <div class="actions hidden">
+          <div class="prog-selwrap hidden">
+            <select class="prog-select"></select>
+          </div>
+        </div>
 
         <div class="bar">
           <span class="left"></span>
@@ -1620,10 +1621,21 @@ class HomeConnectDishwasherCard extends HTMLElement {
     /* En mode alerte on n'expose aucune action : l'appareil demande une
        intervention physique, lui envoyer un ordre n'aurait pas de sens. */
 
-    e.actions.innerHTML = acts
-      .map((a, i) => `<div class="btn${a.ghost ? " ghost" : ""}" data-i="${i}">${a.l}</div>`)
-      .join("");
-    e.actions.classList.toggle("hidden", !acts.length);
+    /* Les boutons remplacés, le sélecteur (premier enfant) est préservé :
+       il est reconstruit dans _update(), pas ici. */
+    const selWrap = e.actions.querySelector(".prog-selwrap");
+    e.actions.innerHTML = "";
+    if (selWrap) e.actions.appendChild(selWrap);
+    acts
+      .map((a, i) => {
+        const el = document.createElement("div");
+        el.className = `btn${a.ghost ? " ghost" : ""}`;
+        el.dataset.i = i;
+        el.textContent = a.l;
+        return el;
+      })
+      .forEach((el) => e.actions.appendChild(el));
+    e.actions.classList.toggle("hidden", !acts.length && !(selWrap && !selWrap.classList.contains("hidden")));
     e.actions.querySelectorAll(".btn").forEach((btn) => {
       const a = acts[Number(btn.dataset.i)];
       btn.addEventListener("click", (ev) => {
@@ -2061,7 +2073,8 @@ ha-card.is-problem{border-color:rgba(201,143,143,.4);}
 /* Programme */
 .prow{margin-top:14px;display:flex;align-items:center;flex-wrap:wrap;gap:6px;}
 .prog-name{font-size:12.5px;font-weight:600;color:rgba(255,255,255,.82);}
-.prog-selwrap{flex:1;min-width:0;}
+.prog-selwrap{flex:1.4;min-width:0;}
+.actions .prog-selwrap.hidden{display:none;}
 .prog-select{width:100%;font-family:inherit;font-size:12px;font-weight:600;color:var(--dw-txt);
   background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.18);border-radius:9px;
   padding:5px 28px 5px 9px;cursor:pointer;appearance:none;-webkit-appearance:none;
