@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.4.0";
+const CARD_VERSION = "2.5.0";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -1106,6 +1106,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
     e.progTxt = $(".ptxt");
     e.steps = $(".steps");
     e.progName = $(".prog-name");
+    e.progSel = $(".prog-select");
+    e.progSelWrap = $(".prog-selwrap");
     e.opts = $(".opts");
     e.progCost = $(".probcost");
     e.cons = $(".cons");
@@ -1142,6 +1144,14 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (e.tariff)
       e.tariff.addEventListener("click", () => {
         if (e.tariff.dataset.e) this._more(e.tariff.dataset.e);
+      });
+    /* Sélecteur de programme : applique le choix sur l'entité select. */
+    if (e.progSel)
+      e.progSel.addEventListener("change", () => {
+        this._hass.callService("select", "select_option", {
+          entity_id: this._config.selected_program,
+          option: e.progSel.value,
+        });
       });
     const hero = $(".hero");
     if (hero) hero.addEventListener("click", () => this._more(c.operation_state));
@@ -1200,6 +1210,9 @@ class HomeConnectDishwasherCard extends HTMLElement {
 
         <div class="prow">
           <span class="prog-name">—</span>
+          <div class="prog-selwrap hidden">
+            <select class="prog-select"></select>
+          </div>
           ${c.show_options ? `<span class="opts"></span>` : ""}
         </div>
         <div class="probcost hidden"></div>`
@@ -1417,7 +1430,38 @@ class HomeConnectDishwasherCard extends HTMLElement {
       e.steps.classList.toggle("hidden", !c.program_phase || idx < 0);
     }
 
-    /* Programme et options */
+    /* Programme et options. Au repos, si l'appareil est sous tension et
+       que le select propose des options, la carte le remplace par un vrai
+       sélecteur : cliquer un programme pour le choisir avant de lancer.
+       Hors de ces conditions on garde le libellé simple — un select
+       « unavailable » côté Home Connect n'est pas pilotable. */
+    const selState = this._st(c.selected_program);
+    const selAvailable =
+      !!selState &&
+      selState.state !== "unavailable" &&
+      Array.isArray(selState.attributes?.options) &&
+      selState.attributes.options.length > 0;
+    const canSelect = !running && !delayed && !problem && selAvailable;
+    if (e.progSelWrap) {
+      e.progSelWrap.classList.toggle("hidden", !canSelect);
+      if (e.progName) e.progName.classList.toggle("hidden", canSelect);
+      if (canSelect && e.progSel) {
+        const opts = selState.attributes.options;
+        if (this._selOptsKey !== opts.join("|") || this._selOptsVal !== selState.state) {
+          this._selOptsKey = opts.join("|");
+          this._selOptsVal = selState.state;
+          e.progSel.innerHTML = opts
+            .map(
+              (o) =>
+                `<option value="${esc(o)}"${o === selState.state ? " selected" : ""}>${esc(
+                  this._programNames[o] || o
+                )}</option>`
+            )
+            .join("");
+        }
+        e.progSel.disabled = false;
+      }
+    }
     if (e.progName) e.progName.textContent = program ? program.label : "—";
     /* Coût estimé du programme sélectionné, au repos : moyenne kWh mesurée
        de CE programme × tarif courant. Sans historique de ce programme,
@@ -2017,6 +2061,15 @@ ha-card.is-problem{border-color:rgba(201,143,143,.4);}
 /* Programme */
 .prow{margin-top:14px;display:flex;align-items:center;flex-wrap:wrap;gap:6px;}
 .prog-name{font-size:12.5px;font-weight:600;color:rgba(255,255,255,.82);}
+.prog-selwrap{flex:1;min-width:0;}
+.prog-select{width:100%;font-family:inherit;font-size:12px;font-weight:600;color:var(--dw-txt);
+  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.18);border-radius:9px;
+  padding:5px 28px 5px 9px;cursor:pointer;appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23ffffff88'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 7px center;background-size:15px;}
+.prog-select:hover{background-color:rgba(255,255,255,.11);}
+.prog-select:focus{outline:none;border-color:var(--dw-info);}
+.prog-select option{background:#1a1d24;color:#eef1f6;}
 .opts{display:flex;flex-wrap:wrap;gap:5px;margin-left:auto;}
 .chip{font-size:9px;font-weight:600;letter-spacing:.3px;padding:3px 7px;border-radius:6px;
   cursor:pointer;background:rgba(143,176,201,.12);border:1px solid rgba(143,176,201,.3);

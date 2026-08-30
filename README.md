@@ -227,6 +227,14 @@ intervalle. Résultat : « Eco 50 °C : 0,92 kWh · 12× ».
 fenêtre affichent « pas encore de mesure » — savoir ce qui n'a jamais été
 vérifié est l'information utile. Les mesurés sont triés en premier.
 
+### Choisir le programme depuis la carte
+
+Au repos, si l'appareil est sous tension, le libellé du programme devient un
+**vrai sélecteur** : on choisit le programme, puis « Démarrer » (ou
+« Démarrer optimisé »). Hors tension ou pendant un cycle, seul le libellé
+s'affiche — un `select` unavailable côté Home Connect n'est pas pilotable,
+afficher un menu mort serait trompeur.
+
 La **note éco** (A–E) compare le dernier cycle à la moyenne de **son propre
 programme** — Eco 50 contre Intensif 70 serait absurde. ±5 % autour de la
 moyenne donne B/C/D, au-delà A ou E. Il faut au moins deux cycles mesurés du
