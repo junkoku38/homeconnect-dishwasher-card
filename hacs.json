@@ -2,5 +2,6 @@
   "name": "Home Connect Dishwasher Card",
   "render_readme": true,
   "filename": "homeconnect-dishwasher-card.js",
-  "homeassistant": "2024.2.0"
+  "homeassistant": "2024.2.0",
+  "version": "2.2.0"
 }
