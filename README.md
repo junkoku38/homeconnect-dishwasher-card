@@ -124,8 +124,13 @@ offpeak_entity: binary_sensor.rte_tempo_heures_creuses
 tariff_switch_entity: sensor.rte_tempo_heures_creuses_changement
 price_low_entity: sensor.tarif_bleu_tempo_heures_creuses_ttc
 price_high_entity: sensor.tarif_bleu_tempo_heures_pleines_ttc
+tempo_color_entity: sensor.rte_tempo_couleur_actuelle
 
 shopping_list: todo.liste_dachats
+
+optimized_start: script.lave_vaisselle_lance_hc
+notify_service: notify.mobile_app_paul
+remind_after: 4
 ```
 
 ### Options
@@ -166,13 +171,22 @@ shopping_list: todo.liste_dachats
 | `refresh` | number | `120` | Secondes entre deux relectures |
  | `show_forecast` / `show_options` | bool | `true` | Masquer ces blocs |
 | `program_names` | objet | `{}` | Surcharge des libellés de programmes |
-| `offpeak_entity` | entity | — | Binaire heures creuses (ex. rtetempo). Active le conseil tarifaire |
+ | `offpeak_entity` | entity | — | Binaire heures creuses (ex. rtetempo). Active le conseil tarifaire |
 | `price_low_entity` | entity | — | Prix kWh heures creuses |
 | `price_high_entity` | entity | — | Prix kWh heures pleines |
 | `tariff_switch_entity` | entity | — | Capteur horodaté du prochain changement de tarif |
+| `tempo_color_entity` | entity | — | Capteur couleur Tempo. Répartition des kWh par couleur ce mois-ci |
 | `shopping_list` | entity | — | Entité `todo.*`. Bouton « ajouter » sur un consommable bas |
 | `shopping_item_salt` / `shopping_item_rinse_aid` | string | libellés par défaut | Texte ajouté à la liste |
 | `drift_percent` | number | `15` | Hausse kWh du dernier cycle déclenchant l'alerte de tendance |
+| `filter_counter` | entity | — | `input_number` de cycles depuis le dernier nettoyage du filtre |
+| `filter_warning` | number | `30` | Cycles déclenchant « à nettoyer » |
+| `tabs_entity` | entity | — | `input_number` de pastilles restantes (bouton « −1 ») |
+| `tabs_low` | number | `10` | Seuil « pastilles basses » |
+| `optimized_start` | entity | — | Script/automatisation de lancement au bon créneau |
+| `notify_service` | string | — | Service de rappel « à vider », ex. `notify.mobile_app_paul` |
+| `remind_after` | number | `4` | Heures avant que le bouton « Me le rappeler » n'apparaisse |
+| `remind_message` | string | message par défaut | Texte de la notification de rappel |
 
 ## Conseil tarifaire
 
@@ -200,6 +214,54 @@ moins. Deux cycles complets minimum, sinon le bloc reste masqué.
 Les états Home Connect de la forme `E24`, `e09`… sont décodés dans le bandeau
 d'alerte : `E24 — Filtre bouché / vidange (code E24)`. Un code brut n'aide
 personne pendant une panne ; la cause, si.
+
+## Stats par programme et note éco
+
+La carte croise l'historique d'`active_program` avec la découpe de cycles :
+chaque cycle est attribué au programme qui couvre le plus long segment de son
+intervalle. Résultat : « Eco 50 °C : 0,92 kWh · 12× ».
+
+La **note éco** (A–E) compare le dernier cycle à la moyenne de **son propre
+programme** — Eco 50 contre Intensif 70 serait absurde. ±5 % autour de la
+moyenne donne B/C/D, au-delà A ou E. Il faut au moins deux cycles mesurés du
+même programme, sinon pas de note.
+
+## Coût estimé avant lancement
+
+Au repos, si le programme sélectionné a un historique mesuré :
+« ≈ 0,15 € (0,92 kWh × 0,1654 €, 12 cycles mesurés) ». Moyenne kWh du
+programme × tarif courant. Sans historique de ce programme, aucune
+estimation — afficher un chiffre inventé serait pire.
+
+## Filtre et pastilles
+
+Home Connect ne connaît ni l'état du filtre, ni les pastilles. La carte
+affiche deux compteurs tenus par des automatisations :
+
+- `filter_counter` : cycles depuis le dernier nettoyage. Passe en rouge à
+  `filter_warning` (défaut 30). Le bouton ✓ remet à zéro — au moment où l'on
+  nettoie, pas avant.
+- `tabs_entity` : pastilles restantes, décrémenté à chaque cycle. Bouton
+  « −1 » pour l'ajustement au moment du rechargement du bac.
+
+La carte ne tient pas ces comptes elle-même : elle peut être fermée,
+rechargée, ouverte deux fois. Un compteur de maintenance ne doit pas dépendre
+d'une carte Lovelace.
+
+## Historique mensuel
+
+Cycles, kWh et € cumulés depuis le 1ᵉʳ du mois. Avec `tempo_color_entity`,
+répartition des kWh par couleur Tempo (bleu/blanc/rouge) : vérifiez d'un coup
+d'œil que vos lancements tombent bien sur les jours bleus.
+
+## Démarrage optimisé et rappel
+
+- `optimized_start` : bouton « Démarrer optimisé » à côté de « Démarrer ».
+  Appelle votre script/automatisation de lancement au bon créneau — la carte
+  délègue, elle ne duplique pas votre logique tarifaire.
+- `notify_service` + `remind_after` : quand la vaisselle est propre depuis
+  trop longtemps (défaut 4 h), le bouton « Me le rappeler » envoie une
+  notification mobile one-shot. Pas de spam : c'est vous qui cliquez.
 
 ### Programmes
 

@@ -1,0 +1,50 @@
+# À ajouter dans configuration.yaml (ou un package dédié),
+# puis redémarrer Home Assistant ou recharger les input_number.
+
+input_number:
+  lave_vaisselle_cycles_filtre:
+    name: Lave-vaisselle : cycles depuis nettoyage filtre
+    min: 0
+    max: 999
+    step: 1
+    initial: 0
+    mode: box
+    unit_of_measurement: cycles
+    icon: mdi:filter
+  lave_vaisselle_pastilles:
+    name: Lave-vaisselle : pastilles restantes
+    min: 0
+    max: 200
+    step: 1
+    initial: 0
+    mode: box
+    unit_of_measurement: pastilles
+    icon: mdi:dishwasher
+
+# Le script de lancement optimisé : adapter selon votre automatisation
+# existante (electromenager_lave_vaisselle_auto_en_hc). Si elle est déjà
+# un script, pointer directement dessus dans la config de la carte :
+#   optimized_start: script.votre_script_existant
+script:
+  lave_vaisselle_lance_hc:
+    alias: Lave-vaisselle : lancer maintenant (optimisé HC/Tempo)
+    sequence:
+      - service: button.press
+        target:
+          entity_id: button.bosch_dishwasher_start
+
+automation:
+  - alias: Lave-vaisselle : tenir les compteurs à jour
+    id: lave_vaisselle_compteurs
+    trigger:
+      - platform: state
+        entity_id: sensor.bosch_dishwasher_operation_state
+        from: Run
+        to: Finished
+    action:
+      - service: input_number.increment
+        target:
+          entity_id: input_number.lave_vaisselle_cycles_filtre
+      - service: input_number.decrement
+        target:
+          entity_id: input_number.lave_vaisselle_pastilles

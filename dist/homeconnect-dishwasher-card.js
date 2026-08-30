@@ -9,7 +9,7 @@
  * https://github.com/junkoku38/homeconnect-dishwasher-card
  */
 
-const CARD_VERSION = "2.2.0";
+const CARD_VERSION = "2.3.0";
 
 console.info(
   `%c HOMECONNECT-DISHWASHER-CARD %c v${CARD_VERSION} `,
@@ -382,6 +382,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (c.salt || c.rinse_aid) n += 1;
     if (c.show_forecast && (c.energy_forecast || c.water_forecast)) n += 1;
     if (c.power) n += 3;
+    if (c.power && c.hours >= 24) n += 2; // stats + tendance
+    if (c.filter_counter || c.tabs_entity) n += 1;
     return n;
   }
 
@@ -392,6 +394,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
     if (c.salt || c.rinse_aid) rows += 1;
     if (c.show_forecast && (c.energy_forecast || c.water_forecast)) rows += 1;
     if (c.power) rows += 3;
+    if (c.power && c.hours >= 24) rows += 2;
+    if (c.filter_counter || c.tabs_entity) rows += 1;
     return { columns: 12, min_rows: 3, max_rows: rows };
   }
 
@@ -548,6 +552,188 @@ class HomeConnectDishwasherCard extends HTMLElement {
     return { vals, last, avg, drift };
   }
 
+  /**
+   * Statistiques par programme. Il faut l'historique d'`active_program` :
+   * on attribue à chaque cycle le programme qui couvre le plus long segment
+   * de son intervalle (un cycle peut démarrer pendant la publication d'un
+   * programme résiduel). Renvoie une Map programme -> { n, kwh, avg }.
+   */
+  _programStats() {
+    const c = this._config;
+    const cycles = this._cycles();
+    const hist = this._samples(c.active_program, false);
+    if (!cycles.length || !hist.length) return null;
+    const map = new Map();
+    for (const seg of cycles) {
+      if (seg[2] === true) continue; // cycle en cours : mesure incomplète
+      const r = this._cycleEnergy(seg[0], seg[1]);
+      if (!r || r.kwh <= 0.05) continue;
+      /* programme couvrant la plus grande part de l'intervalle */
+      let best = null;
+      let bestCover = 0;
+      let lastVal = hist[0][1];
+      for (let i = 0; i < hist.length; i++) {
+        const t0 = hist[i][0];
+        const t1 = i + 1 < hist.length ? hist[i + 1][0] : Date.now();
+        const s0 = Math.max(t0, seg[0]);
+        const s1 = Math.min(t1, seg[1]);
+        if (s1 > s0 && t1 > seg[0]) lastVal = hist[i][1];
+        if (t0 > seg[1]) break;
+        const cover = Math.max(0, s1 - s0);
+        if (cover > bestCover && lastVal && !["unknown", "unavailable", "None"].includes(lastVal)) {
+          bestCover = cover;
+          best = lastVal;
+        }
+      }
+      if (!best) continue;
+      const cur = map.get(best) || { n: 0, kwh: 0 };
+      cur.n += 1;
+      cur.kwh += r.kwh;
+      map.set(best, cur);
+    }
+    if (!map.size) return null;
+    for (const v of map.values()) v.avg = v.kwh / v.n;
+    return map;
+  }
+
+  /**
+   * Note éco du dernier cycle : A s'il consomme nettement moins que la
+   * moyenne de son propre programme, E s'il la dépasse largement. Le
+   * comparatif doit être intra-programme : Eco 50 contre Intensif 70
+   * serait absurde.
+   */
+  _ecoGrade() {
+    const c = this._config;
+    const stats = this._programStats();
+    if (!stats) return null;
+    const cycles = this._cycles();
+    if (!cycles.length) return null;
+    /* dernier cycle complet */
+    const seg = cycles[cycles.length - 1];
+    if (!seg || seg[2] === true) return null;
+    const r = this._cycleEnergy(seg[0], seg[1]);
+    if (!r || r.kwh <= 0.05) return null;
+    /* programme du cycle */
+    const hist = this._samples(c.active_program, false);
+    let prog = null;
+    let bestCover = 0;
+    let lastVal = hist[0]?.[1];
+    for (let i = 0; i < hist.length; i++) {
+      const t0 = hist[i][0];
+      const t1 = i + 1 < hist.length ? hist[i + 1][0] : Date.now();
+      const s0 = Math.max(t0, seg[0]);
+      const s1 = Math.min(t1, seg[1]);
+      if (s1 > s0 && t1 > seg[0]) lastVal = hist[i][1];
+      if (t0 > seg[1]) break;
+      const cover = Math.max(0, s1 - s0);
+      if (cover > bestCover && lastVal && !["unknown", "unavailable", "None"].includes(lastVal)) {
+        bestCover = cover;
+        prog = lastVal;
+      }
+    }
+    if (!prog) return null;
+    const st = stats.get(prog);
+    if (!st || st.n < 2) return null;
+    const dev = st.avg > 0 ? ((r.kwh - st.avg) / st.avg) * 100 : null;
+    if (dev == null) return null;
+    /* échelle : ±5 % autour de la moyenne = B/C/D, au-delà = A/E */
+    let grade;
+    if (dev <= -15) grade = "A";
+    else if (dev <= -5) grade = "B";
+    else if (dev < 5) grade = "C";
+    else if (dev < 15) grade = "D";
+    else grade = "E";
+    return { grade, dev, kwh: r.kwh, avg: st.avg, prog };
+  }
+
+  /**
+   * Coût estimé du programme sélectionné, au repos : moyenne kWh mesurée de
+   * ce programme × tarif courant. Sans historique de ce programme, rien —
+   * on n'invente pas de kWh.
+   */
+  _estimatedCost() {
+    const c = this._config;
+    if (this._mode() !== "idle") return null;
+    const selRaw = this._s(c.selected_program);
+    if (!selRaw || ["unknown", "unavailable"].includes(selRaw)) return null;
+    const stats = this._programStats();
+    if (!stats) return null;
+    const st = stats.get(selRaw);
+    if (!st) return null;
+    const price = this._price();
+    if (!price) return null;
+    return { kwh: st.avg, cost: st.avg * price, n: st.n, prog: selRaw };
+  }
+
+  /**
+   * Historique mensuel : cycles, kWh et € cumulés depuis le début du mois,
+   * plus la répartition des kWh par couleur Tempo si `tempo_color_entity`
+   * est fournie. Renvoie null si aucune donnée.
+   */
+  _monthly() {
+    const c = this._config;
+    const cycles = this._cycles();
+    if (!cycles.length) return null;
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    const hist = c.tempo_color_entity ? this._samples(c.tempo_color_entity, false) : [];
+    const colors = new Map(); // couleur -> kWh
+    let n = 0;
+    let kwh = 0;
+    for (const seg of cycles) {
+      if (seg[2] === true) continue;
+      if (seg[1] < monthStart.getTime()) continue;
+      const r = this._cycleEnergy(seg[0], seg[1]);
+      if (!r || r.kwh <= 0.05) continue;
+      n += 1;
+      kwh += r.kwh;
+      if (hist.length) {
+        /* couleur au milieu du cycle */
+        const mid = (seg[0] + seg[1]) / 2;
+        let col = null;
+        for (const [t, v] of hist) {
+          if (t > mid) break;
+          if (v && !["unknown", "unavailable"].includes(v)) col = v;
+        }
+        if (col) colors.set(col, (colors.get(col) || 0) + r.kwh);
+      }
+    }
+    if (!n) return null;
+    const price = this._price();
+    return { n, kwh, cost: price ? kwh * price : null, colors };
+  }
+
+  /**
+   * Compteur de filtre : nombre de cycles depuis la dernière remise à zéro.
+   * `filter_counter` est un input_number tenu à jour par une automatisation
+   * (incrémenté en fin de cycle). La carte ne l'incrémente pas elle-même :
+   * elle peut être rechargée, fermée, ouverte deux fois — un compteur de
+   * maintenance ne doit pas dépendre d'une carte Lovelace.
+   */
+  _filterInfo() {
+    const c = this._config;
+    const v = this._num(c.filter_counter);
+    if (v == null) return null;
+    const warn = Number(c.filter_warning) || 30;
+    return { count: Math.round(v), warn, due: v >= warn };
+  }
+
+  /**
+   * Pastilles lave-vaisselle : Home Connect ne les voit pas. `tabs_entity`
+   * est un input_number décrémenté par une automatisation à chaque fin de
+   * cycle. La carte l'affiche et offre le bouton « −1 » pour la recharge,
+   * car c'est au moment où l'on re remplit le bac que l'on ajuste le
+   * compte.
+   */
+  _tabsInfo() {
+    const c = this._config;
+    const v = this._num(c.tabs_entity);
+    if (v == null) return null;
+    const low = Number(c.tabs_low) || 10;
+    return { count: Math.round(v), low, empty: v <= 0, lowv: v <= low };
+  }
+
   _fmt(v, dec = 2) {
     if (v == null || Number.isNaN(v)) return "—";
     return new Intl.NumberFormat(this._lang(), { maximumFractionDigits: dec }).format(v);
@@ -701,7 +887,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
 
   async _fetch() {
     const c = this._config;
-    const ids = [c.power, c.energy, c.operation_state].filter(Boolean);
+    const ids = [c.power, c.energy, c.operation_state, c.active_program].filter(Boolean);
     if (!ids.length || !this._hass || this._busy) return;
     this._busy = true;
     try {
@@ -882,6 +1068,7 @@ class HomeConnectDishwasherCard extends HTMLElement {
     e.steps = $(".steps");
     e.progName = $(".prog-name");
     e.opts = $(".opts");
+    e.progCost = $(".probcost");
     e.cons = $(".cons");
     e.forecast = $(".forecast");
     e.tofill = $(".tofill");
@@ -900,6 +1087,13 @@ class HomeConnectDishwasherCard extends HTMLElement {
     e.trendVal = $(".trend .tv");
     e.trendSlot = $(".trend .tslot");
     e.trendNote = $(".trend .tnote");
+    e.pstats = $(".pstats");
+    e.plist = $(".pstats .plist");
+    e.monthly = $(".monthly");
+    e.monthlyVal = $(".monthly .mv");
+    e.mcolors = $(".monthly .mcolors");
+    e.filters = $(".filters");
+    e.frow = $(".filters .frow");
     e.foot = $(".bar");
     e.footLeft = $(".bar .left");
     e.footRight = $(".bar .right");
@@ -968,7 +1162,8 @@ class HomeConnectDishwasherCard extends HTMLElement {
         <div class="prow">
           <span class="prog-name">—</span>
           ${c.show_options ? `<span class="opts"></span>` : ""}
-        </div>`
+        </div>
+        <div class="probcost hidden"></div>`
             : ""
         }
 
@@ -1005,6 +1200,23 @@ class HomeConnectDishwasherCard extends HTMLElement {
           </div>
           <div class="tslot"></div>
           <div class="tnote"></div>
+        </div>
+
+        <div class="pstats hidden">
+          <div class="fh">Consommation par programme</div>
+          <div class="plist"></div>
+        </div>
+
+        <div class="monthly hidden">
+          <div class="thead">
+            <span class="k">Ce mois-ci</span>
+            <span class="mv">—</span>
+          </div>
+          <div class="mcolors"></div>
+        </div>
+
+        <div class="filters hidden">
+          <div class="frow"></div>
         </div>
 
         <div class="bilan">
@@ -1168,6 +1380,17 @@ class HomeConnectDishwasherCard extends HTMLElement {
 
     /* Programme et options */
     if (e.progName) e.progName.textContent = program ? program.label : "—";
+    /* Coût estimé du programme sélectionné, au repos : moyenne kWh mesurée
+       de CE programme × tarif courant. Sans historique de ce programme,
+       aucune estimation — afficher un chiffre inventé serait pire. */
+    if (e.progCost) {
+      const est = this._estimatedCost();
+      e.progCost.classList.toggle("hidden", !est);
+      if (est) {
+        const price = this._price();
+        e.progCost.textContent = `≈ ${this._fmt(est.cost, 2)} ${c.currency} (${this._fmt(est.kwh, 2)} kWh × ${this._fmt(price, 4)} €, ${est.n} cycle${est.n > 1 ? "s" : ""} mesuré${est.n > 1 ? "s" : ""})`;
+      }
+    }
     if (e.opts) {
       const map = [
         ["extra_dry", "Séchage +"],
@@ -1284,11 +1507,25 @@ class HomeConnectDishwasherCard extends HTMLElement {
       if (avail(c.stop_button)) acts.push({ l: "Arrêter", ghost: true, id: c.stop_button });
     } else if (mode === "done") {
       if (c.clean_flag) acts.push({ l: "Marquer comme vidé", flag: c.clean_flag });
+      /* Rappel mobile : la vaisselle traîne depuis trop longtemps et
+         personne n'a appuyé sur « à vider ». One-shot via persistent
+         notification — pas de spam. */
+      const flag = this._st(c.clean_flag);
+      if (c.notify_service && flag) {
+        const hrs = (Date.now() - new Date(flag.last_changed).getTime()) / 3600000;
+        if (hrs >= (Number(c.remind_after) || 4)) {
+          acts.push({ l: "Me le rappeler", ghost: true, notify: true });
+        }
+      }
     } else if (mode === "delayed") {
       /* Un départ est déjà programmé : proposer « Démarrer » serait ambigu. */
       if (avail(c.stop_button)) acts.push({ l: "Annuler le départ", ghost: true, id: c.stop_button });
     } else if (mode === "idle") {
       if (avail(c.start_button)) acts.push({ l: "Démarrer", id: c.start_button });
+      /* Démarrage optimisé : délègue à un script/automatisation existant
+         (ex. décalage en heures creuses Tempo). La carte ne duplique pas
+         la logique tarifaire, elle l'appelle. */
+      if (avail(c.optimized_start)) acts.push({ l: "Démarrer optimisé", ghost: true, id: c.optimized_start });
       /* Interrupteur Marche/Veille (Home Connect local l'expose) :
          allumer l'appareil pour pouvoir choisir un programme, ou le
          mettre en veille s'il traîne allumé sans cycle. */
@@ -1308,7 +1545,18 @@ class HomeConnectDishwasherCard extends HTMLElement {
       const a = acts[Number(btn.dataset.i)];
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        if (a.flag) {
+        if (a.notify) {
+          /* notify_service : "notify.mobile_app_paul" -> service notify.*
+            avec le message configuré. */
+          const svc = String(this._config.notify_service || "");
+          const dot = svc.indexOf(".");
+          if (dot > 0) {
+            this._hass.callService(svc.slice(0, dot), svc.slice(dot + 1), {
+              title: this._config.name || "Lave-vaisselle",
+              message: this._config.remind_message || "La vaisselle est prête à être vidée.",
+            });
+          }
+        } else if (a.flag) {
           const d = domainOf(a.flag);
           this._hass.callService(d === "input_boolean" ? d : "homeassistant", "turn_off", {
             entity_id: a.flag,
@@ -1387,6 +1635,102 @@ class HomeConnectDishwasherCard extends HTMLElement {
       } else {
         e.trend.classList.add("hidden");
       }
+    }
+
+    /* Stats par programme */
+    if (e.pstats) {
+      const stats = this._programStats();
+      const grade = this._ecoGrade();
+      if (stats && stats.size) {
+        e.pstats.classList.remove("hidden");
+        const rows = [...stats.entries()]
+          .sort((a, b) => b[1].kwh - a[1].kwh)
+          .map(([prog, st]) => {
+            const label = this._programNames[prog] || prog;
+            const hot = grade && grade.prog === prog;
+            return `<div class="prow2${hot ? " hot" : ""}">
+              <span class="pn">${esc(label)}</span>
+              <span class="pv">${this._fmt(st.avg, 2)} kWh<span class="pn2"> · ${st.n}×</span></span>
+            </div>`;
+          })
+          .join("");
+        const gradeHtml = grade
+          ? `<div class="grade ${grade.grade <= "B" ? "ok" : grade.grade >= "D" ? "bad" : ""}" title="Écart à la moyenne de ce programme : ${grade.dev > 0 ? "+" : ""}${Math.round(grade.dev)} %">Note ${grade.grade}</div>`
+          : "";
+        e.plist.innerHTML = rows + gradeHtml;
+      } else {
+        e.pstats.classList.add("hidden");
+      }
+    }
+
+    /* Historique mensuel */
+    if (e.monthly) {
+      const m = this._monthly();
+      if (m) {
+        e.monthly.classList.remove("hidden");
+        e.monthlyVal.textContent =
+          `${m.n} cycle${m.n > 1 ? "s" : ""} · ${this._fmt(m.kwh, 1)} kWh` +
+          (m.cost != null ? ` · ${this._fmt(m.cost, 2)} ${this._config.currency}` : "");
+        const TEMPO_COLOR = { bleu: "#4f8fe0", blanc: "#d9d9d9", rouge: "#c95f5f" };
+        const parts = [];
+        if (m.colors.size) {
+          for (const [col, kwh] of [...m.colors.entries()].sort((a, b) => b[1] - a[1])) {
+            const v = norm(col);
+            const dot = TEMPO_COLOR[v] || "#8fb0c9";
+            parts.push(
+              `<span class="mchip"><i style="background:${dot}"></i>${esc(col)} ${this._fmt(kwh, 1)} kWh</span>`
+            );
+          }
+        }
+        e.mcolors.innerHTML = parts.join("");
+        e.mcolors.classList.toggle("hidden", !parts.length);
+      } else {
+        e.monthly.classList.add("hidden");
+      }
+    }
+
+    /* Filtre + pastilles */
+    if (e.frow) {
+      const cells = [];
+      const fi = this._filterInfo();
+      if (fi) {
+        cells.push(`<div class="fcell${fi.due ? " due" : ""}" data-e="${esc(this._config.filter_counter)}">
+          <svg viewBox="0 0 24 24"><path d="M3 5h18l-2 11H5L3 5zm2.3 13h13.4l-.4 2.2c-.1.5-.5.8-1 .8H6.7c-.5 0-.9-.3-1-.8L5.3 18z"/></svg>
+          <div class="ft2"><div class="fk">Filtre</div>
+          <div class="fv">${fi.due ? "à nettoyer" : `${fi.count} cycle${fi.count > 1 ? "s" : ""}`}</div></div>
+          <button class="freset" data-reset="filter" title="Remettre le compteur à zéro (filtre nettoyé)">${ICONS.check}</button>
+        </div>`);
+      }
+      const tabs = this._tabsInfo();
+      if (tabs) {
+        cells.push(`<div class="fcell${tabs.empty ? " due" : tabs.lowv ? " low" : ""}" data-e="${esc(this._config.tabs_entity)}">
+          <svg viewBox="0 0 24 24"><path d="M4 7h16v3H4V7zm0 5h16v10H4V12zm2-9 1-2h10l1 2H6z"/></svg>
+          <div class="ft2"><div class="fk">Pastilles</div>
+          <div class="fv">${tabs.empty ? "à recharger" : `${tabs.count} pastille${tabs.count > 1 ? "s" : ""}`}</div></div>
+          <button class="fminus" data-minus="tabs" title="Une pastille de moins">−1</button>
+        </div>`);
+      }
+      e.frow.innerHTML = cells.join("");
+      e.filters.classList.toggle("hidden", !cells.length);
+      /* actions locales : remise à zéro du filtre, pastille consommée */
+      e.frow.querySelectorAll(".freset").forEach((btn) =>
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this._hass.callService("input_number", "set_value", {
+            entity_id: this._config.filter_counter,
+            value: 0,
+          });
+        })
+      );
+      e.frow.querySelectorAll(".fminus").forEach((btn) =>
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const cur = this._num(this._config.tabs_entity) ?? 0;
+          this._hass.callService("input_number", "decrement", {
+            entity_id: this._config.tabs_entity,
+          });
+        })
+      );
     }
 
     /* Énergie du cycle : intégration de la puissance sur l'intervalle du
@@ -1690,6 +2034,60 @@ ha-card.is-problem{border-color:rgba(201,143,143,.4);}
 .trend .spark{width:100%;height:30px;display:block;margin-top:7px;}
 .tnote{font-size:9.5px;color:rgba(255,255,255,.4);margin-top:4px;}
 
+/* Stats par programme */
+.pstats{margin-top:14px;padding:11px 12px;border-radius:12px;
+  background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);}
+.pstats .fh{margin-bottom:8px;}
+.prow2{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
+  font-size:11px;padding:4px 0;color:rgba(255,255,255,.72);}
+.prow2 .pn{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}
+.prow2 .pv{font-variant-numeric:tabular-nums;flex-shrink:0;color:rgba(255,255,255,.85);}
+.prow2 .pn2{color:rgba(255,255,255,.38);font-size:10px;}
+.prow2.hot .pn2{color:var(--dw-info);}
+.grade{margin-top:8px;padding:6px 10px;border-radius:8px;font-size:10.5px;font-weight:700;
+  text-align:center;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);
+  color:rgba(255,255,255,.75);}
+.grade.ok{background:rgba(143,191,174,.12);border-color:rgba(143,191,174,.35);color:var(--dw-ok);}
+.grade.bad{background:rgba(201,143,143,.12);border-color:rgba(201,143,143,.35);color:var(--dw-bad);}
+
+/* Historique mensuel */
+.monthly{margin-top:14px;}
+.mv{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;color:rgba(255,255,255,.85);}
+.mcolors{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px;}
+.mchip{display:inline-flex;align-items:center;gap:5px;font-size:10px;
+  padding:3px 8px;border-radius:6px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.09);color:rgba(255,255,255,.7);
+  font-variant-numeric:tabular-nums;}
+.mchip i{width:7px;height:7px;border-radius:50%;display:inline-block;}
+
+/* Coût estimé programme */
+.probcost{margin-top:5px;font-size:10px;color:rgba(255,255,255,.42);
+  font-variant-numeric:tabular-nums;}
+
+/* Filtre & pastilles */
+.filters{margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:7px;}
+@media (max-width:340px){.filters{grid-template-columns:1fr;}}
+.fcell{display:flex;align-items:center;gap:9px;padding:10px 11px;border-radius:12px;
+  cursor:pointer;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.075);
+  transition:.15s;}
+.fcell svg{width:16px;height:16px;flex-shrink:0;fill:rgba(255,255,255,.35);}
+.ft2{flex:1;min-width:0;}
+.fk{font-size:8.5px;letter-spacing:1px;text-transform:uppercase;
+  color:rgba(255,255,255,.4);font-weight:600;}
+.fv{font-size:12.5px;font-weight:600;margin-top:2px;color:rgba(255,255,255,.8);}
+.fcell.low{background:rgba(223,179,122,.09);border-color:rgba(223,179,122,.3);}
+.fcell.low svg{fill:var(--dw-warn);}
+.fcell.low .fv{color:var(--dw-warn);}
+.fcell.due{background:rgba(201,143,143,.11);border-color:rgba(201,143,143,.36);}
+.fcell.due svg{fill:var(--dw-bad);}
+.fcell.due .fv{color:var(--dw-bad);}
+.freset,.fminus{border:none;border-radius:8px;width:26px;height:26px;flex-shrink:0;
+  cursor:pointer;padding:4px;background:rgba(255,255,255,.07);display:flex;
+  align-items:center;justify-content:center;font-size:12px;font-weight:700;
+  color:rgba(255,255,255,.7);transition:.15s;font-family:inherit;}
+.freset svg{width:100%;height:100%;fill:rgba(255,255,255,.6);}
+.freset:hover,.fminus:hover{background:rgba(255,255,255,.14);color:var(--dw-txt);}
+
 /* Pied */
 .bar{margin-top:14px;padding-top:11px;border-top:1px solid rgba(255,255,255,.07);
   display:flex;align-items:center;justify-content:space-between;gap:10px;
@@ -1712,6 +2110,9 @@ const FLAT_KEYS = [
   "cycle_energy", "cycle_water", "cycle_duration", "consumable_warning",
   "offpeak_entity", "price_low_entity", "price_high_entity", "tariff_switch_entity",
   "shopping_list", "shopping_item_salt", "shopping_item_rinse_aid", "drift_percent",
+  "filter_counter", "filter_warning", "tabs_entity", "tabs_low",
+  "optimized_start", "notify_service", "remind_after", "remind_message",
+  "tempo_color_entity",
   "hours", "points", "refresh", "show_forecast", "show_options",
 ];
 const MANAGED_KEYS = [...FLAT_KEYS, "type", "program_names", "state_map", "consumable_map", "phase_weights", "remaining_unit"];
@@ -1742,6 +2143,15 @@ const LABELS = {
   shopping_list: "Liste de courses (todo)",
   shopping_item_salt: "Libellé sel pour la liste", shopping_item_rinse_aid: "Libellé rinçage pour la liste",
   drift_percent: "Seuil d'alerte de dérive (%)",
+  filter_counter: "Compteur de filtre (input_number)",
+  filter_warning: "Seuil de nettoyage filtre (cycles)",
+  tabs_entity: "Pastilles restantes (input_number)",
+  tabs_low: "Seuil pastilles basses",
+  optimized_start: "Démarrage optimisé (script/automatisation)",
+  notify_service: "Service de notification (rappel)",
+  remind_after: "Rappel à vider après (heures)",
+  remind_message: "Message du rappel",
+  tempo_color_entity: "Couleur Tempo (capteur)",
   hours: "Fenêtre d'historique", points: "Échantillons de courbe",
   refresh: "Relecture des données",
   show_forecast: "Afficher les prévisions", show_options: "Afficher les options actives",
@@ -1772,6 +2182,16 @@ const HELPERS = {
     "Entité todo (ex. todo.liste_dachats). Ajoute un bouton « liste de courses » sur un consommable bas.",
   drift_percent:
     "Au-delà de cette hausse du kWh du dernier cycle par rapport à la moyenne, la tendance passe en rouge.",
+  filter_counter:
+    "input_number incrémenté à chaque fin de cycle par une automatisation. La carte l'affiche et le bouton le remet à zéro au nettoyage.",
+  tabs_entity:
+    "input_number du nombre de pastilles restantes, décrémenté par une automatisation à chaque cycle. Bouton « −1 » pour l'ajustement au rechargement.",
+  optimized_start:
+    "Script ou automatisation qui lance le lave-vaisselle au bon créneau tarifaire (ex. Tempo HC). La carte appelle, elle ne duplique pas la logique.",
+  notify_service:
+    "Service de notification pour le rappel « à vider », ex. notify.mobile_app_paul. Format service complet.",
+  remind_after:
+    "Le bouton « Me le rappeler » n'apparaît que si la vaisselle est propre depuis ce nombre d'heures.",
 };
 
 const SCHEMA = [
@@ -1809,6 +2229,15 @@ const SCHEMA = [
           { name: "shopping_item_rinse_aid", selector: { text: {} } },
         ],
       },
+      { name: "filter_counter", selector: { entity: { filter: [{ domain: ["input_number", "counter", "sensor"] }] } } },
+      { name: "tabs_entity", selector: { entity: { filter: [{ domain: ["input_number", "sensor"] }] } } },
+      {
+        type: "grid", name: "",
+        schema: [
+          { name: "filter_warning", selector: { number: { min: 1, max: 100, mode: "box", unit_of_measurement: "cycles" } } },
+          { name: "tabs_low", selector: { number: { min: 0, max: 100, mode: "box" } } },
+        ],
+      },
     ],
   },
   {
@@ -1817,6 +2246,15 @@ const SCHEMA = [
       { name: "start_button", selector: { entity: { filter: [{ domain: ["button", "script", "scene"] }] } } },
       { name: "pause_button", selector: { entity: { filter: [{ domain: ["button", "script"] }] } } },
       { name: "stop_button", selector: { entity: { filter: [{ domain: ["button", "script"] }] } } },
+      { name: "optimized_start", selector: { entity: { filter: [{ domain: ["script", "automation", "button"] }] } } },
+      { name: "notify_service", selector: { text: {} } },
+      {
+        type: "grid", name: "",
+        schema: [
+          { name: "remind_after", selector: { number: { min: 1, max: 48, mode: "box", unit_of_measurement: "h" } } },
+          { name: "remind_message", selector: { text: {} } },
+        ],
+      },
     ],
   },
   {
@@ -1858,6 +2296,7 @@ const SCHEMA = [
       { name: "tariff_switch_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_datetime"] }] } } },
       { name: "price_low_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
       { name: "price_high_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
+      { name: "tempo_color_entity", selector: { entity: { filter: [{ domain: ["sensor"] }] } } },
     ],
   },
   {
